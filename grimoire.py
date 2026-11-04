@@ -293,6 +293,7 @@ DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
         "find_next": ["ctrl+n"],
         "find_prev": ["ctrl+p"],
         "view": ["enter", "o"],
+        "record": ["v"],
         "undo": ["ctrl+z"],
         "redo": ["ctrl+y"],
     },
@@ -556,44 +557,173 @@ def split_row(raw: str, delimiter: str) -> list[str]:
         return [raw]
 
 
-def table_renderer(path: Path, lines: list[str]):
-    """CSV and TSV read as aligned columns. The cursor line stays the raw text, so editing still works."""
-    delimiter = TABLE_EXT.get(path.suffix.lower())
-    if delimiter is None:
-        return None
-    widths: list[int] = []
-    for raw in lines[:2000]:
-        for i, cell in enumerate(split_row(raw, delimiter)):
-            size = min(len(cell.strip()), TABLE_CELL_MAX)
-            if i < len(widths):
-                widths[i] = max(widths[i], size)
-            else:
-                widths.append(size)
-    header = lines[0] if lines else None
+def cell_offset(raw: str, delimiter: str, index: int) -> int:
+    """Character where cell `index` starts in the raw line. Quoted delimiters do not count."""
+    if index <= 0:
+        return 0
+    quoted = False
+    seen = 0
+    for i, ch in enumerate(raw):
+        if ch == '"':
+            quoted = not quoted
+        elif ch == delimiter and not quoted:
+            seen += 1
+            if seen == index:
+                return i + 1
+    return len(raw)
 
-    def render(raw: str):
-        if not raw.strip():
-            return []
-        cells = split_row(raw, delimiter)
-        style = HEADING if raw == header else TEXT
-        out: list[tuple[str, str]] = []
-        for i, cell in enumerate(cells):
-            text = cell.strip()
-            if len(text) > TABLE_CELL_MAX:
-                text = text[: TABLE_CELL_MAX - 1] + "…"
-            width = widths[i] if i < len(widths) else len(text)
-            if i:
-                out.append((" │ ", DIM))
-            out.append((text.ljust(width) if i < len(cells) - 1 else text, style))
+
+def is_number(text: str) -> bool:
+    try:
+        float(text.replace(",", ""))
+    except ValueError:
+        return False
+    return True
+
+
+@dataclass
+class Table:
+    rows: list[list[str]]
+    widths: list[int]
+    numeric: list[bool]
+
+    @property
+    def columns(self) -> int:
+        return len(self.widths)
+
+    def cell(self, row: int, col: int) -> str:
+        if 0 <= row < len(self.rows) and 0 <= col < len(self.rows[row]):
+            return self.rows[row][col]
+        return ""
+
+    def header(self, col: int) -> str:
+        return self.cell(0, col) or f"column {col + 1}"
+
+
+def parse_table(lines: list[str], delimiter: str) -> Table:
+    rows = [[cell.strip() for cell in split_row(raw, delimiter)] if raw.strip() else [] for raw in lines]
+    count = max((len(r) for r in rows), default=0)
+    widths = [1] * count
+    numeric = [True] * count
+    filled = [False] * count
+    for index, cells in enumerate(rows):
+        for col, text in enumerate(cells):
+            widths[col] = max(widths[col], min(len(text), TABLE_CELL_MAX))
+            if index > 0 and text:
+                filled[col] = True
+                if not is_number(text):
+                    numeric[col] = False
+    numeric = [n and f for n, f in zip(numeric, filled)]
+    return Table(rows, widths, numeric)
+
+
+def fit_cell(text: str, width: int, right: bool) -> str:
+    if len(text) > width:
+        text = text[: max(0, width - 1)] + "…"
+    return text.rjust(width) if right else text.ljust(width)
+
+
+def table_window(table: Table, col: int, width: int, sep: int = 3) -> list[int]:
+    """Columns that fit. Column 0 is frozen; the rest scroll so `col` stays visible."""
+    if table.columns == 0:
+        return []
+    frozen = table.widths[0]
+    room = width - frozen - 2  # keep space for the › that says more is to the right
+    if col <= 0:
+        start = 1
+    else:
+        start = col
+        used = table.widths[col] + sep
+        while start > 1 and used + table.widths[start - 1] + sep <= room:
+            start -= 1
+            used += table.widths[start] + sep
+    shown = [0]
+    used = 0
+    for c in range(start, table.columns):
+        need = table.widths[c] + sep
+        if used + need > room and len(shown) > 1:
+            break
+        shown.append(c)
+        used += need
+    return shown
+
+
+def table_layout(
+    table: Table,
+    row: int,
+    col: int,
+    height: int,
+    width: int,
+) -> list[tuple[int, int, list[tuple[str, str]]]]:
+    """Grid view. The header stays on top, the first column stays on the left."""
+    if height < 1 or not table.rows:
+        return []
+    shown = table_window(table, col, width)
+
+    def line(index: int, style: str) -> list[tuple[str, str]]:
+        spans: list[tuple[str, str]] = []
+        for n, c in enumerate(shown):
+            if n:
+                mark = " ‹ " if n == 1 and c > 1 else " │ "
+                spans.append((mark, DIM))
+            text = fit_cell(table.cell(index, c), table.widths[c], table.numeric[c] and index > 0)
+            spans.append((text, SELECTED if index == row and c == col else style))
+        if shown and shown[-1] < table.columns - 1:
+            spans.append((" ›", DIM))
+        return spans
+
+    out = [(0, 0, line(0, HEADING))]
+    body = height - 1
+    total = len(table.rows) - 1
+    if body < 1 or total < 1:
         return out
+    cursor = max(1, row)
+    top = max(1, min(cursor - body // 2, total - body + 1))
+    for y, index in enumerate(range(top, min(top + body, total + 1)), start=1):
+        out.append((y, 0, line(index, TEXT)))
+    return out
 
-    return render
+
+def record_layout(
+    table: Table,
+    row: int,
+    col: int,
+    height: int,
+    width: int,
+) -> list[tuple[int, int, list[tuple[str, str]]]]:
+    """One row turned on its side: header on the left, value on the right."""
+    if height < 1:
+        return []
+    record = max(1, row) if len(table.rows) > 1 else 0
+    label_w = min(max((len(table.header(c)) for c in range(table.columns)), default=1), TABLE_CELL_MAX)
+    out = [(0, 0, [(f"record {record} of {max(0, len(table.rows) - 1)}", DIM)])]
+    value_w = max(1, width - label_w - 2)
+    lines: list[tuple[int, list[tuple[str, str]]]] = []
+    for c in range(table.columns):
+        value = table.cell(record, c)
+        chunks = [value[i : i + value_w] for i in range(0, len(value), value_w)] or [""]
+        label = fit_cell(table.header(c), label_w, False)
+        for k, chunk in enumerate(chunks):
+            left = label if k == 0 else " " * label_w
+            style = SELECTED if c == col else TEXT
+            lines.append((c, [(left, HEADING if k == 0 else DIM), ("  ", DIM), (chunk, style)]))
+    body = height - 1
+    focus = next((i for i, (c, _) in enumerate(lines) if c == col), 0)
+    top = max(0, min(focus - body // 2, len(lines) - body))
+    for y, (_, spans) in enumerate(lines[top : top + body], start=1):
+        out.append((y, 0, spans))
+    return out
 
 
 def pick_renderer(path: Path, lines: list[str], plugins=None):
-    """A plugin renderer wins. Otherwise tables get the built-in one."""
-    custom = plugins.renderer_for(path) if plugins else None
-    return custom if custom is not None else table_renderer(path, lines)
+    """Plugin renderers. Tables are drawn by table_layout, not line by line."""
+    return plugins.renderer_for(path) if plugins else None
+
+
+def table_delimiter(path: Path | None, plugins=None) -> str | None:
+    if path is None or (plugins and plugins.renderer_for(path)):
+        return None
+    return TABLE_EXT.get(path.suffix.lower())
 
 
 def page_slug(path: Path, library: Path) -> str:
@@ -1307,6 +1437,7 @@ def help_lines(name: str, keys: KeyMap | None = None) -> tuple[str, ...]:
         f"  {bound.show('normal', 'insert')}   insert at the cursor",
         f"  {bound.show('normal', 'view')}   view the image on this line",
         f"  {bound.show('normal', 'append')}   append, then type",
+        f"  {bound.show('normal', 'record')}   .csv/.tsv: grid or one record at a time",
         f"  {bound.show('normal', 'leave')} {bound.show('normal', 'quit')}   back, asks if unsaved",
         "",
         "Reader, insert",
@@ -1367,6 +1498,10 @@ class App:
         self.inserting = False
         self.plugins: PluginHost | None = None
         self.renderer = None
+        self.delimiter: str | None = None
+        self.tcol = 0
+        self.record = False
+        self._table: tuple[tuple[str, ...], Table] | None = None
         self.backlinks: list[str] = []
         self.undo: list[tuple[list[str], int, int]] = []
         self.redo: list[tuple[list[str], int, int]] = []
@@ -1420,7 +1555,11 @@ class App:
         self.path = path
         self.markdown = path.suffix.lower() in MARKDOWN_EXT
         self.renderer = pick_renderer(path, self.lines, self.plugins)
-        self.row = 0
+        self.delimiter = table_delimiter(path, self.plugins)
+        self.tcol = 0
+        self.record = False
+        self._table = None
+        self.row = 1 if self.delimiter and len(self.lines) > 1 else 0
         self.col = 0
         self.pref_col = 0
         self.mode = "read"
@@ -1440,6 +1579,27 @@ class App:
             self.fences = [False]
         self.row = max(0, min(self.row, len(self.lines) - 1))
         self.col = max(0, min(self.col, len(self.lines[self.row])))
+
+    def table(self) -> Table | None:
+        if not self.delimiter:
+            return None
+        key = tuple(self.lines)
+        if self._table is None or self._table[0] != key:
+            self._table = (key, parse_table(self.lines, self.delimiter))
+        return self._table[1]
+
+    def table_view(self) -> bool:
+        return self.delimiter is not None and not self.inserting and self.mode != "search"
+
+    def move_cell(self, drow: int, dcol: int) -> None:
+        table = self.table()
+        if table is None:
+            return
+        if self.record:
+            drow, dcol = dcol, drow
+        self.tcol = max(0, min(table.columns - 1, self.tcol + dcol))
+        self.row = max(0, min(len(self.lines) - 1, self.row + drow))
+        self.col = cell_offset(self.lines[self.row], self.delimiter or ",", self.tcol)
 
     def move_row(self, delta: int) -> None:
         self.row = max(0, min(len(self.lines) - 1, self.row + delta))
@@ -1685,6 +1845,9 @@ class App:
         return True
 
     def begin_insert(self, *, append: bool) -> None:
+        if self.delimiter and not append:
+            self.col = cell_offset(self.lines[self.row], self.delimiter, self.tcol)
+            self.pref_col = self.col
         if append:
             self.col = len(self.lines[self.row])
             self.pref_col = self.col
@@ -1712,6 +1875,25 @@ class App:
         if self.keys.pressed(mode, "redo", key):
             self.redo_edit()
             return True
+        if self.delimiter and not self.inserting:
+            moves = {"up": (-1, 0), "down": (1, 0), "left": (0, -1), "right": (0, 1),
+                     "page_up": (-page, 0), "page_down": (page, 0)}
+            for action, (dr, dc) in moves.items():
+                if self.keys.pressed("normal", action, key):
+                    self.move_cell(dr, dc)
+                    return True
+            table = self.table()
+            if self.keys.pressed("normal", "line_start", key):
+                self.move_cell(0, -10_000) if not self.record else self.move_cell(-10_000, 0)
+                return True
+            if self.keys.pressed("normal", "line_end", key):
+                self.move_cell(0, 10_000) if not self.record else self.move_cell(10_000, 0)
+                return True
+            if self.keys.pressed("normal", "record", key) and table is not None:
+                self.record = not self.record
+                if self.record and self.row == 0 and len(self.lines) > 1:
+                    self.row = 1
+                return True
         if self.keys.pressed(mode, "up", key):
             self.move_row(-1)
             return True
@@ -2096,6 +2278,21 @@ def bar_spec(app: App) -> tuple[list[str], str, str]:
             key_hint(keys, "insert", "save", "save"),
             key_hint(keys, "normal", "help", "keys"),
         ], keys.show("normal", "help"), right
+    table = app.table() if app.table_view() else None
+    if table is not None:
+        right = f"row {max(1, app.row)}/{max(0, len(table.rows) - 1)}  col {app.tcol + 1}/{table.columns}"
+        value = table.cell(app.row, app.tcol)
+        here = f"{table.header(app.tcol)}: {value}" if app.row > 0 else table.header(app.tcol)
+        if len(here) > 60:
+            here = here[:59] + "…"
+        parts = [
+            app.message or ("unsaved" if app.dirty else here),
+            key_hint(keys, "normal", "record", "grid" if app.record else "record"),
+            key_hint(keys, "normal", "insert", "edit"),
+            key_hint(keys, "normal", "leave", "back"),
+            key_hint(keys, "normal", "help", "keys"),
+        ]
+        return parts, keys.show("normal", "help"), right
     parts = [
         "normal",
         key_hint(keys, "normal", "insert", "insert"),
@@ -2239,17 +2436,22 @@ def draw_list(stdscr: curses.window, app: App, rows: int, cols: int) -> None:
 def draw_read(stdscr: curses.window, app: App, rows: int, cols: int) -> None:
     link_row = 1 if app.backlinks else 0
     content_h = rows - 1 - link_row
-    painted = doc_layout(
-        app.lines,
-        app.row,
-        app.col,
-        content_h,
-        cols - 1,
-        markdown=app.markdown,
-        fences=app.fences,
-        renderer=app.renderer,
-        note=app.path,
-    )
+    table = app.table() if app.table_view() else None
+    if table is not None:
+        layout = record_layout if app.record else table_layout
+        painted = layout(table, app.row, app.tcol, content_h, cols - 1)
+    else:
+        painted = doc_layout(
+            app.lines,
+            app.row,
+            app.col,
+            content_h,
+            cols - 1,
+            markdown=app.markdown,
+            fences=app.fences,
+            renderer=app.renderer,
+            note=app.path,
+        )
     paint_spans(stdscr, painted, 0, cols, rows)
     if app.backlinks:
         put(
@@ -2737,6 +2939,7 @@ def run(argv: list[str] | None = None) -> None:
         app.plugins = plugins
         if open_file is not None:
             app.renderer = pick_renderer(open_file, app.lines, plugins)
+            app.delimiter = table_delimiter(open_file, plugins)
             plugins.emit("open", app)
         curses.wrapper(lambda stdscr: main(stdscr, app))
     finally:

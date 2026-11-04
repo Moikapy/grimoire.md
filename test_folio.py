@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Renderer tests. No tty required."""
 
+import curses
 import tempfile
 import unittest
 import os
@@ -225,22 +226,76 @@ class ParseTests(unittest.TestCase):
             app = App(Path(tmp), name="GRIMOIRE")
             self.assertEqual(app.title(), "GRIMOIRE")
 
-    def test_csv_reads_as_aligned_table(self):
-        from grimoire import pick_renderer
+    def _csv_app(self, tmp, lines):
+        path = Path(tmp) / "speed.csv"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return App(Path(tmp), path)
+
+    @staticmethod
+    def _text(painted):
+        return {y: "".join(t for t, _ in spans) for y, _, spans in painted}
+
+    def test_csv_grid_aligns_and_right_aligns_numbers(self):
+        from grimoire import table_layout
+        lines = ["Date,Upload,Server", "11/04/2026,851.31,Spectrum", '06/01/2026,"62.9",Spectrum']
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "speed.csv"
-            lines = ["Date,Upload,Server", "11/04/2026,851.31,Spectrum", '06/01/2026,"162.99",Spectrum']
-            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            app = App(Path(tmp), path)
-            self.assertIsNotNone(app.renderer)
-            painted = doc_layout(lines, 2, 0, height=6, width=80, markdown=False, renderer=app.renderer)
-            rows = {y: "".join(t for t, _ in spans) for y, _, spans in painted}
-            styles = {y: [s for _, s in spans] for y, _, spans in painted}
-            self.assertEqual(rows[0], "Date       │ Upload │ Server")
-            self.assertIn(HEADING, styles[0])
+            app = self._csv_app(tmp, lines)
+            self.assertEqual(app.delimiter, ",")
+            self.assertEqual(app.row, 1)  # starts on the first data row, not the header
+            painted = table_layout(app.table(), app.row, app.tcol, 6, 80)
+            rows = self._text(painted)
+            self.assertEqual(rows[0], "Date       │ Upload │ Server  ")
             self.assertEqual(rows[1], "11/04/2026 │ 851.31 │ Spectrum")
-            self.assertEqual(rows[2], lines[2])  # cursor line stays raw for editing
-            self.assertIsNone(pick_renderer(Path(tmp) / "note.md", ["# hi"]))
+            self.assertEqual(rows[2], "06/01/2026 │   62.9 │ Spectrum")
+            header_styles = {s for _, s in painted[0][2] if s != grimoire.DIM}
+            self.assertEqual(header_styles, {HEADING})
+
+    def test_csv_scrolls_sideways_with_frozen_first_column(self):
+        from grimoire import table_layout
+        head = "Date," + ",".join(f"Col{i}" for i in range(1, 13))
+        body = "11/04/2026," + ",".join(f"v{i:03d}" for i in range(1, 13))
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._csv_app(tmp, [head, body, body])
+            for _ in range(11):
+                app.handle_read(curses.KEY_RIGHT)
+            self.assertEqual(app.tcol, 11)
+            rows = self._text(table_layout(app.table(), app.row, app.tcol, 6, 40))
+            self.assertTrue(rows[0].startswith("Date "))
+            self.assertIn("Col11", rows[0])
+            self.assertNotIn("Col1 ", rows[0])
+            self.assertIn(" ‹ ", rows[0])  # hidden columns on the left
+            self.assertTrue(rows[1].startswith("11/04/2026"))
+            for y in rows:
+                self.assertLessEqual(len(rows[y]), 40)
+            app.handle_read(curses.KEY_DOWN)
+            self.assertEqual(app.row, 2)
+
+    def test_csv_record_view_and_edit_lands_on_cell(self):
+        from grimoire import record_layout
+        lines = ["Date,Upload,Server", "11/04/2026,851.31,Spectrum", "06/01/2026,162.99,Spectrum"]
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._csv_app(tmp, lines)
+            app.handle_read(ord("v"))
+            self.assertTrue(app.record)
+            app.handle_read(curses.KEY_DOWN)  # next field in record view
+            self.assertEqual((app.row, app.tcol), (1, 1))
+            app.handle_read(curses.KEY_RIGHT)  # next record
+            self.assertEqual(app.row, 2)
+            rows = self._text(record_layout(app.table(), app.row, app.tcol, 10, 60))
+            self.assertEqual(rows[0], "record 2 of 2")
+            self.assertEqual(rows[2], "Upload  162.99")
+            app.handle_read(ord("i"))
+            self.assertTrue(app.inserting)
+            self.assertEqual(app.col, len("06/01/2026,"))
+            self.assertFalse(app.table_view())  # editing shows the raw line
+
+    def test_plugin_renderer_beats_table_view(self):
+        from grimoire import table_delimiter, PluginHost
+        host = PluginHost()
+        host.renderers[".csv"] = lambda line: [(line, "text")]
+        self.assertIsNone(table_delimiter(Path("a.csv"), host))
+        self.assertEqual(table_delimiter(Path("a.tsv"), host), "\t")
+        self.assertIsNone(table_delimiter(Path("a.md")))
 
     def test_plugin_key_and_renderer(self):
         from grimoire import load_plugins
