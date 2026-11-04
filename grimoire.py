@@ -319,6 +319,13 @@ DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
         "select_down": ["down", "j"],
         "select_left": ["left", "h"],
         "select_right": ["right", "l"],
+        "zoom_in": ["+", "="],
+        "zoom_out": ["-"],
+        "fit": ["0"],
+        "pan_left": ["H"],
+        "pan_right": ["L"],
+        "pan_up": ["K"],
+        "pan_down": ["J"],
         "help": ["?", "f1"],
     },
     "insert": {
@@ -1535,6 +1542,9 @@ def help_lines(name: str, keys: KeyMap | None = None) -> tuple[str, ...]:
         f"  {bound.show('graph', 'select_left')} {bound.show('graph', 'select_right')} {bound.show('graph', 'select_up')} {bound.show('graph', 'select_down')}   move the selection",
         f"  {bound.show('graph', 'open')}   open the selected page",
         f"  {bound.show('graph', 'leave')}   back; from the page it returns here",
+        f"  {bound.show('graph', 'zoom_in')} {bound.show('graph', 'zoom_out')} zoom   {bound.show('graph', 'fit')} re-fit",
+        f"  {bound.show('graph', 'pan_left')} {bound.show('graph', 'pan_down')} {bound.show('graph', 'pan_up')} {bound.show('graph', 'pan_right')}   pan",
+        "  mouse   click to select, again to open, wheel zooms",
         f"  ctrl+c  quit    {bound.show('graph', 'quit')} quits",
         "",
         "Keys live in ~/.grimoire/keys.json. grimoire keys writes the file.",
@@ -2268,7 +2278,9 @@ class App:
         self.gview = None
         self.mode = "graph"
         self.graph_refresh()
-        settle_layout(self.gstate)
+        if len(self.gstate["shown"]) > GRAPH_NODE_MAX:
+            settle_layout(self.gstate)
+            self.message = f"{len(self.gstate['shown'])} nodes, settled before draw"
         return True
 
     def graph_refresh(self) -> None:
@@ -2330,6 +2342,24 @@ class App:
             if self.keys.pressed("graph", action, key):
                 self.graph_move(vector)
                 return True
+        pans = {"pan_left": (-1, 0), "pan_right": (1, 0), "pan_up": (0, -1), "pan_down": (0, 1)}
+        for action, (sx, sy) in pans.items():
+            if self.keys.pressed("graph", action, key):
+                cols, rows = self.glast
+                if self.gview is not None:
+                    self.gview = pan_view(self.gview, 4 * sx, 4 * sy, cols, rows - 1)
+                return True
+        if self.keys.pressed("graph", "zoom_in", key):
+            if self.gview is not None:
+                self.gview = zoom_view(self.gview, 1.25)
+            return True
+        if self.keys.pressed("graph", "zoom_out", key):
+            if self.gview is not None:
+                self.gview = zoom_view(self.gview, 0.8)
+            return True
+        if self.keys.pressed("graph", "fit", key):
+            self.gview = None
+            return True
         return True
 
     def graph_move(self, vector: tuple[int, int]) -> None:
@@ -2343,6 +2373,37 @@ class App:
         if self.gsel not in screen:
             return
         self.gsel = cone_pick(screen, self.gsel, vector)
+
+    def graph_mouse(self) -> bool:
+        try:
+            _, x, y, _, bstate = curses.getmouse()
+        except curses.error:
+            return True
+        cols, rows = self.glast
+        view = self.gview
+        st = self.gstate
+        if st is None or view is None:
+            return True
+        dot = ((x + 0.5) * 2, (y + 0.5) * 4)
+        if bstate & curses.BUTTON4_PRESSED:
+            self.gview = zoom_view(view, 1.25, dot[0], dot[1], cols, rows - 1)
+            return True
+        if bstate & curses.BUTTON5_PRESSED:
+            self.gview = zoom_view(view, 0.8, dot[0], dot[1], cols, rows - 1)
+            return True
+        if bstate & (curses.BUTTON1_DOUBLE_CLICKED | curses.BUTTON1_TRIPLE_CLICKED):
+            return self.graph_open_selected()
+        if bstate & curses.BUTTON1_PRESSED:
+            screen = graph_screen(st, view, cols, rows - 1)
+            if not screen:
+                return True
+            best = min(screen, key=lambda slug: math.hypot(screen[slug][0] - dot[0], screen[slug][1] - dot[1]))
+            if math.hypot(screen[best][0] - dot[0], screen[best][1] - dot[1]) > 24:
+                return True
+            if best == self.gsel:
+                return self.graph_open_selected()
+            self.gsel = best
+        return True
 
 
 # Graph view. Positions, projection and raster plans are plain data, so the
@@ -2816,9 +2877,12 @@ def draw_graph(stdscr: curses.window, app: App, rows: int, cols: int) -> None:
     screen = graph_screen(st, view, cols, rows)
     canvas, styles = graph_raster(st, screen, app.gsel, graph_neighbors(st, app.gsel))
     focus = {app.gsel} | graph_neighbors(st, app.gsel)
+    shown_zoom = view["z"] > view.get("zfit", view["z"])
     items: list[tuple[str, float, float, float, int, str]] = []
     for slug, node in st["shown"].items():
-        if slug not in focus and node["missing"]:
+        if slug not in focus and not (shown_zoom and not node["missing"]):
+            continue
+        if node["missing"] and slug != app.gsel:
             continue
         at = screen[slug]
         items.append((slug, node["degree"], at[0], at[1], node_radius(node), node["title"]))
@@ -3015,6 +3079,8 @@ def bar_spec(app: App) -> tuple[list[str], str, str]:
             extra,
             "enter open",
             key_hint(keys, "graph", "leave", "back"),
+            f"{keys.show('graph', 'zoom_in')} {keys.show('graph', 'zoom_out')} zoom",
+            key_hint(keys, "graph", "help", "keys"),
             key_hint(keys, "graph", "quit", "quit"),
         ]
         if app.message:
@@ -3648,13 +3714,22 @@ def main(stdscr: curses.window, app: App) -> None:
     stdscr.keypad(True)
     pending = True
     try:
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        except curses.error:
+            pass
         while True:
-            stdscr.timeout(400 if app.mode == "list" else -1)
+            busy = app.mode == "graph" and app.gstate is not None and not app.gstate.get("settled", True)
+            stdscr.timeout(33 if busy else 400 if app.mode == "list" else -1)
             if pending:
                 draw(stdscr, app)
                 pending = False
             key = stdscr.getch()
             if key == -1:
+                if busy:
+                    app.step_graph()
+                    pending = True
+                    continue
                 pending = app.poll_shelf()
                 continue
             if not app.handle(key):

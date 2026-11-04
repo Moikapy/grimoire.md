@@ -713,6 +713,21 @@ class GraphTests(unittest.TestCase):
                 os.environ.pop("GRIMOIRE_CONFIG", None)
 
 
+    def test_zoom_and_pan_transforms(self):
+        view = {"cx": 0.0, "cy": 0.0, "z": 10.0, "zfit": 10.0}
+        dx, dy = grimoire.project(0.5, -0.5, view, 40, 12)
+        self.assertEqual((dx, dy), (44.0, 17.0))
+        back = grimoire.unproject(dx, dy, view, 40, 12)
+        self.assertAlmostEqual(back[0], 0.5)
+        self.assertAlmostEqual(back[1], -0.5)
+        zoomed = grimoire.zoom_view(view, 2.0, 44.0, 17.0, 40, 12)
+        point = grimoire.project(0.5, -0.5, zoomed, 40, 12)
+        self.assertEqual(point, (44.0, 17.0))
+        panned = grimoire.pan_view(view, 10, 0, 40, 12)
+        self.assertAlmostEqual(panned["cx"], -1.0)
+        self.assertEqual(view, {"cx": 0.0, "cy": 0.0, "z": 10.0, "zfit": 10.0})
+
+
 def math_dist(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
