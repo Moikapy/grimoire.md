@@ -225,6 +225,23 @@ class ParseTests(unittest.TestCase):
             app = App(Path(tmp), name="GRIMOIRE")
             self.assertEqual(app.title(), "GRIMOIRE")
 
+    def test_csv_reads_as_aligned_table(self):
+        from grimoire import pick_renderer
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "speed.csv"
+            lines = ["Date,Upload,Server", "11/04/2026,851.31,Spectrum", '06/01/2026,"162.99",Spectrum']
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            app = App(Path(tmp), path)
+            self.assertIsNotNone(app.renderer)
+            painted = doc_layout(lines, 2, 0, height=6, width=80, markdown=False, renderer=app.renderer)
+            rows = {y: "".join(t for t, _ in spans) for y, _, spans in painted}
+            styles = {y: [s for _, s in spans] for y, _, spans in painted}
+            self.assertEqual(rows[0], "Date       │ Upload │ Server")
+            self.assertIn(HEADING, styles[0])
+            self.assertEqual(rows[1], "11/04/2026 │ 851.31 │ Spectrum")
+            self.assertEqual(rows[2], lines[2])  # cursor line stays raw for editing
+            self.assertIsNone(pick_renderer(Path(tmp) / "note.md", ["# hi"]))
+
     def test_plugin_key_and_renderer(self):
         from grimoire import load_plugins
         with tempfile.TemporaryDirectory() as tmp:

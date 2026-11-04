@@ -14,6 +14,7 @@ The display name is lore. The command and the config keys stay plain.
 
 from __future__ import annotations
 
+import csv
 import curses
 import importlib.util
 import json
@@ -35,8 +36,10 @@ TEXT_EXT = {
     ".md", ".markdown", ".txt", ".sh", ".bash", ".zsh", ".fish",
     ".py", ".lua", ".js", ".ts", ".mjs", ".cjs", ".rb", ".go",
     ".rs", ".toml", ".yaml", ".yml", ".json", ".css", ".html",
-    ".conf", ".ini", ".service", ".desktop",
+    ".conf", ".ini", ".service", ".desktop", ".csv", ".tsv",
 }
+TABLE_EXT = {".csv": ",", ".tsv": "\t"}
+TABLE_CELL_MAX = 28
 MD_SUFFIXES = (".markdown", ".md")
 MARKDOWN_EXT = set(MD_SUFFIXES)
 REMOTE = ("http://", "https://", "mailto:")
@@ -544,6 +547,53 @@ def read_lines(path: Path) -> tuple[list[str], str]:
         lines = lines[:MAX_LINES]
         note = f"truncated at {MAX_LINES} lines"
     return lines or [""], note
+
+
+def split_row(raw: str, delimiter: str) -> list[str]:
+    try:
+        return next(csv.reader([raw], delimiter=delimiter))
+    except (csv.Error, StopIteration):
+        return [raw]
+
+
+def table_renderer(path: Path, lines: list[str]):
+    """CSV and TSV read as aligned columns. The cursor line stays the raw text, so editing still works."""
+    delimiter = TABLE_EXT.get(path.suffix.lower())
+    if delimiter is None:
+        return None
+    widths: list[int] = []
+    for raw in lines[:2000]:
+        for i, cell in enumerate(split_row(raw, delimiter)):
+            size = min(len(cell.strip()), TABLE_CELL_MAX)
+            if i < len(widths):
+                widths[i] = max(widths[i], size)
+            else:
+                widths.append(size)
+    header = lines[0] if lines else None
+
+    def render(raw: str):
+        if not raw.strip():
+            return []
+        cells = split_row(raw, delimiter)
+        style = HEADING if raw == header else TEXT
+        out: list[tuple[str, str]] = []
+        for i, cell in enumerate(cells):
+            text = cell.strip()
+            if len(text) > TABLE_CELL_MAX:
+                text = text[: TABLE_CELL_MAX - 1] + "…"
+            width = widths[i] if i < len(widths) else len(text)
+            if i:
+                out.append((" │ ", DIM))
+            out.append((text.ljust(width) if i < len(cells) - 1 else text, style))
+        return out
+
+    return render
+
+
+def pick_renderer(path: Path, lines: list[str], plugins=None):
+    """A plugin renderer wins. Otherwise tables get the built-in one."""
+    custom = plugins.renderer_for(path) if plugins else None
+    return custom if custom is not None else table_renderer(path, lines)
 
 
 def page_slug(path: Path, library: Path) -> str:
@@ -1369,7 +1419,7 @@ class App:
         self.fences = fence_flags(self.lines)
         self.path = path
         self.markdown = path.suffix.lower() in MARKDOWN_EXT
-        self.renderer = self.plugins.renderer_for(path) if self.plugins else None
+        self.renderer = pick_renderer(path, self.lines, self.plugins)
         self.row = 0
         self.col = 0
         self.pref_col = 0
@@ -2686,7 +2736,7 @@ def run(argv: list[str] | None = None) -> None:
         app = App(root, open_file, name=cfg["name"])
         app.plugins = plugins
         if open_file is not None:
-            app.renderer = plugins.renderer_for(open_file)
+            app.renderer = pick_renderer(open_file, app.lines, plugins)
             plugins.emit("open", app)
         curses.wrapper(lambda stdscr: main(stdscr, app))
     finally:
