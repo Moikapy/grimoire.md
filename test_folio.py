@@ -5,6 +5,7 @@ import curses
 import tempfile
 import unittest
 import os
+import sys
 import json
 from pathlib import Path
 
@@ -201,6 +202,11 @@ class ParseTests(unittest.TestCase):
     def test_wiki_link_hides_brackets(self):
         spans = render_unfocused("see [[welcome]] now", markdown=True, in_fence=False)
         self.assertEqual([t for t, _ in spans], ["see ", "welcome", " now"])
+
+    def test_image_is_not_a_page_link(self):
+        from grimoire import links_in
+        text = "![shot](/home/x/pic.png)\n![rel](img/a.png)\nSee [home](welcome.md) and [[links]].\n"
+        self.assertEqual(links_in(text), ["links", "welcome"])
 
     def test_graph_backlinks(self):
         from grimoire import build_graph, write_graph
@@ -589,6 +595,48 @@ class ParseTests(unittest.TestCase):
             self.assertEqual(hits[0]["slug"], "note")
             with self.assertRaises(ValueError):
                 grimoire.page_file("../outside", library)
+
+
+class AgentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.library = Path(self.tmp.name)
+        self.cfg = {"library": str(self.library)}
+
+    def test_dotted_slugs_do_not_collide(self):
+        grimoire.write_page("v1", "one", self.cfg)
+        grimoire.write_page("v1.2", "two", self.cfg)
+        self.assertEqual(grimoire.read_page("v1", self.cfg), "one\n")
+        self.assertEqual(grimoire.read_page("v1.2", self.cfg), "two\n")
+        self.assertTrue((self.library / "v1.2.md").is_file())
+
+    def test_write_leaves_no_temp_file(self):
+        grimoire.write_page("note", "hi", self.cfg)
+        names = sorted(p.name for p in self.library.iterdir())
+        self.assertNotIn(".note.md.tmp", names)
+        self.assertIn("note.md", names)
+
+    def test_mcp_survives_non_object_lines(self):
+        import io
+        lines = [
+            "[1]", "5", '"x"', "not json",
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json.dumps({"jsonrpc": "2.0", "id": 3, "method": "nope"}),
+        ]
+        out = io.StringIO()
+        old_in, old_out = sys.stdin, sys.stdout
+        sys.stdin, sys.stdout = io.StringIO("\n".join(lines) + "\n"), out
+        try:
+            grimoire.serve_mcp()
+        finally:
+            sys.stdin, sys.stdout = old_in, old_out
+        replies = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual([r["id"] for r in replies], [1, 2, 3])
+        self.assertEqual(replies[0]["result"], {})
+        self.assertEqual(len(replies[1]["result"]["tools"]), len(grimoire.MCP_TOOLS))
+        self.assertEqual(replies[2]["error"]["code"], -32601)
 
 
 if __name__ == "__main__":

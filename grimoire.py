@@ -802,7 +802,7 @@ def links_in(text: str) -> list[str]:
     found: list[str] = []
     for match in re.finditer(r"\[\[([^\]|#]+)", text):
         found.append(match.group(1).strip())
-    for match in re.finditer(r"\[[^\]]*\]\(([^)]+)\)", text):
+    for match in re.finditer(r"(?<!!)\[[^\]]*\]\(([^)]+)\)", text):  # ![alt](x) is an image, not a page
         target = match.group(1).strip().split("#", 1)[0]
         if target.startswith(REMOTE):
             continue
@@ -2782,7 +2782,7 @@ def page_file(slug: str, library: Path) -> Path:
     rel = Path(raw)
     if not raw or rel.is_absolute() or ".." in rel.parts or any(part.startswith(".") for part in rel.parts):
         raise ValueError(f"bad page {slug}")
-    path = (library / rel).with_suffix(".md").resolve()
+    path = (library / rel).with_name(rel.name + ".md").resolve()  # with_suffix would turn v1.2 into v1.md
     path.relative_to(library.resolve())
     return path
 
@@ -2817,7 +2817,9 @@ def write_page(slug: str, text: str, cfg: dict[str, str] | None = None) -> dict[
     path.parent.mkdir(parents=True, exist_ok=True)
     if text and not text.endswith("\n"):
         text += "\n"
-    path.write_text(text, encoding="utf-8")
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)  # a crash mid-write leaves the old page, not half of the new one
     write_graph(library)
     return {"slug": page_slug(path, library), "path": str(path)}
 
@@ -2926,7 +2928,7 @@ def serve_mcp() -> None:
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if "id" not in msg:
+        if not isinstance(msg, dict) or "id" not in msg:
             continue
         method = msg.get("method")
         mid = msg["id"]
