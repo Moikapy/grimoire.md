@@ -53,7 +53,7 @@ Plugins are plain Python files in `~/.grimoire/plugins`. Each one defines `regis
 
 ## Graph
 
-`g` on the shelf opens the graph of the whole library. `g` on a page opens it with that page selected. Pages that link to nothing still sit on their own: every node repels the others, links act as springs, and a little gravity pulls the whole thing to the middle. The same library settles in the same shape every time.
+`g` on the shelf opens the graph of the whole library. ctrl+g on a page opens it with that page selected (`g` on a page still jumps to the top, like everywhere else). Pages that link to nothing still sit on their own: every node repels the others, links act as springs, and a little gravity pulls the whole thing to the middle. The same library settles in the same shape every time.
 
 The picture is drawn with braille dots, two per column and four per row, so lines stay lines. Each folder gets one color from the theme (`graph_1` to `graph_8`, in sorted folder order; top-level pages are their own group) and each link is a dim line. Color roles go in `~/.grimoire/theme.json` like the rest. The selected page and its neighbors get bold labels and bright edges; other labels appear when they fit. Arrow keys or `hjkl` move the selection to the nearest node in that direction. Enter opens the page, and Esc on the page returns to the graph, Esc in the graph returns to where you came from. The node's size grows with its link count.
 
@@ -65,7 +65,7 @@ Links to pages that do not exist show as hollow dim nodes with the raw link text
 
 `/` filters: type a few letters, and only pages with those letters in the slug or the title stay, with the edges between them. Esc clears the filter. ? lists the graph keys.
 
-Physics is O(n^2) per step, so a few hundred nodes animate at a comfortable pace; above 400 nodes the graph settles before the first draw instead. Node dragging with the mouse is not supported.
+Physics is O(n^2) per step, so a few hundred nodes animate at a comfortable pace; above 400 nodes the graph settles before the first draw, capped at two seconds, then keeps settling as you watch (an oversized graph stops moving after about twelve seconds). Opening a very large library takes a moment the first time. Node dragging with the mouse is not supported.
 
 ## Images
 

@@ -357,14 +357,14 @@ DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
         "save": ["f2", "ctrl+s"],
         "reload": ["f5"],
         "help": ["f1"],
-        "find": ["/", "ctrl+f"],
+        "find": ["/"],
         "find_next": ["ctrl+n"],
         "find_prev": ["ctrl+p"],
         "view": ["enter", "o"],
         "record": ["v"],
         "undo": ["ctrl+z"],
         "redo": ["ctrl+y"],
-        "graph": ["g", "ctrl+g"],
+        "graph": ["ctrl+g"],
     },
     "graph": {
         "quit": ["ctrl+q"],
@@ -2230,6 +2230,13 @@ class App:
                 return hit
         return True
 
+    def back_to_graph(self) -> bool:
+        """Leave a page for the graph it was opened from."""
+        self.graph_return = False
+        self.mode = "graph"
+        self.message = ""
+        return True
+
     def handle_confirm(self, key: int | str) -> bool:
         if self.keys.pressed("confirm", "yes", key):
             if self.message == "reload":
@@ -2240,6 +2247,8 @@ class App:
                 self.message = "reloaded"
                 return True
             if self.save():
+                if self.graph_return:
+                    return self.back_to_graph()
                 return self.leave_reader()
             self.mode = "read"
             return True
@@ -2248,6 +2257,8 @@ class App:
                 self.mode = "read"
                 self.message = ""
                 return True
+            if self.graph_return:
+                return self.back_to_graph()
             return self.leave_reader()
         if self.keys.pressed("confirm", "stay", key):
             self.mode = "read"
@@ -2349,8 +2360,8 @@ class App:
         self.gview = None
         self.mode = "graph"
         self.graph_refresh()
-        if len(self.gstate["shown"]) > GRAPH_NODE_MAX:
-            settle_layout(self.gstate)
+        if self.gstate is not None and len(self.gstate["shown"]) > GRAPH_NODE_MAX:
+            settle_layout(self.gstate, seconds=2.0)
             self.message = f"{len(self.gstate['shown'])} nodes, settled before draw"
         return True
 
@@ -2364,7 +2375,15 @@ class App:
         old = (self.gstate or {}).get("pos", {})
         pos = {slug: old[slug] for slug in nodes if slug in old}
         pos.update({slug: xy for slug, xy in seed_positions(sorted(set(nodes) - set(pos))).items()})
-        self.gstate = {"pos": pos, "vel": {slug: (0.0, 0.0) for slug in nodes}, "edges": edges, "links": link_map(edges), "settled": False, "moved": 0.0}
+        self.gstate = {
+            "pos": pos,
+            "vel": {slug: (0.0, 0.0) for slug in nodes},
+            "edges": edges,
+            "links": link_map(edges),
+            "settled": False,
+            "moved": float("inf"),
+            "started": time.perf_counter(),
+        }
         self.gshown = {"nodes": nodes, "edges": edges, "colors": graph_colors(nodes)}
         self.gstate["shown"] = nodes
         self.gstate["colors"] = graph_colors(nodes)
@@ -2385,14 +2404,21 @@ class App:
         if st is None or st.get("settled"):
             return
         budget = time.perf_counter() + 0.02
+        count = max(1, len(st["pos"]))
         for _ in range(30):
-            if step_layout(st) < 0.01:
+            step_layout(st)
+            if st["moved"] / count < 0.002:
                 st["settled"] = True
                 if self.gview is not None and self.gview.get("auto"):
                     self.gview = None
                 break
             if time.perf_counter() >= budget:
                 break
+        if time.perf_counter() - st["started"] > GRAPH_ANIMATE_SECONDS:
+            # a very large graph could keep drifting for minutes; freeze it
+            st["settled"] = True
+            if self.gview is not None and self.gview.get("auto"):
+                self.gview = None
 
     def graph_open_selected(self) -> bool:
         nodes = self.gshown["nodes"]
@@ -2490,6 +2516,8 @@ class App:
         if self.keys.pressed("gfilter", "accept", key):
             self.gfilter = self.gquery
             self.graph_refresh()
+            if self.gstate is not None and not self.gstate["shown"]:
+                self.message = f"no pages match /{self.gfilter}"
             self.gquery = ""
             self.mode = "graph"
             return True
@@ -2538,6 +2566,7 @@ class App:
 MISSING_MARK = "\x00"
 GRAPH_NODE_MAX = 400
 GRAPH_STEP_SECONDS = 0.033
+GRAPH_ANIMATE_SECONDS = 12.0  # keep spinning at most this long before freezing
 GRAPH_COLOR_ROLES = tuple(f"graph_{n}" for n in range(1, 9))
 
 
@@ -2624,13 +2653,15 @@ def link_map(edges: list[tuple[str, str]]) -> dict[str, list[str]]:
 
 
 def step_layout(state: dict) -> float:
-    """One round of repulsion, springs and gravity. Returns total movement."""
+    """One round of repulsion, springs and gravity. Returns total movement and
+    the fastest node's movement in state['spread'] — the settle test."""
     pos: dict[str, tuple[float, float]] = state["pos"]
     vel: dict[str, tuple[float, float]] = state["vel"]
     touch: dict[str, list[str]] = state["links"]
     slugs = list(pos)
     fresh: dict[str, tuple[float, float]] = {}
     moved = 0.0
+    spread = 0.0
     for slug in slugs:
         px, py = pos[slug]
         fx = fy = 0.0
@@ -2659,15 +2690,26 @@ def step_layout(state: dict) -> float:
         fresh[slug] = (px + vx, py + vy)
         vel[slug] = (vx, vy)
         moved += abs(vx) + abs(vy)
+        spread = max(spread, abs(vx), abs(vy))
     state["pos"] = fresh
     state["moved"] = moved
+    state["spread"] = spread
     return moved
 
 
-def settle_layout(state: dict, max_steps: int = 300, eps: float = 0.01) -> dict:
+def settle_layout(state: dict, max_steps: int = 300, eps: float = 0.002, seconds: float | None = None) -> dict:
+    """Run steps until the average node is slow enough, capped by count and wall time.
+
+    A total-movement threshold never fires on big graphs: five hundred nearly
+    still nodes still add up. So compare the movement per node."""
+    start = time.perf_counter()
     steps = 0
-    while steps < max_steps and step_layout(state) >= eps:
+    count = max(1, len(state["pos"]))
+    while steps < max_steps and state.get("moved", float("inf")) / count >= eps:
+        step_layout(state)
         steps += 1
+        if seconds is not None and time.perf_counter() - start >= seconds:
+            break
     state["settled"] = True
     state["steps"] = steps
     return state
@@ -2962,7 +3004,7 @@ def place_cells(
     runs: list[tuple[int, int, str, int]] = []
     order = sorted((cy, cx) for cx, cy in canvas)
     for cy, cx in order:
-        if (cx, cy) in covered:
+        if cx < 0 or cy < 0 or (cx, cy) in covered:
             continue
         bits = canvas[(cx, cy)]
         style = styles.get((cx, cy), "graph_edge")

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import os
 import sys
+import time
 import json
 from pathlib import Path
 
@@ -898,6 +899,156 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(replies[2]["error"]["code"], -32601)
         self.assertEqual(replies[3]["result"]["protocolVersion"], "2024-11-05")
         self.assertTrue(replies[4]["result"]["isError"])
+
+
+class GraphKeyAndFlowTests(unittest.TestCase):
+    @staticmethod
+    def pages(d: dict) -> dict:
+        base = {"path": "", "title": "", "links": [], "missing": [], "backlinks": []}
+        return {slug: {key: (list(value) if isinstance(value, list) else value) for key, value in {**base, **spec}.items()} for slug, spec in d.items()}
+
+    @staticmethod
+    def make_app(tmp: str, body: str = "# One\nhello\n") -> tuple[App, str | None]:
+        root = Path(tmp)
+        library = root / "pages"
+        library.mkdir(exist_ok=True)
+        (library / "one.md").write_text(body, encoding="utf-8")
+        cfg = root / "config.json"
+        cfg.write_text(json.dumps({"library": str(library)}), encoding="utf-8")
+        old = os.environ.get("GRIMOIRE_CONFIG")
+        os.environ["GRIMOIRE_CONFIG"] = str(cfg)
+        app = App(root, library / "one.md")
+        return app, old
+
+    def test_no_key_is_bound_to_two_actions_in_one_mode(self):
+        for mode, actions in grimoire.DEFAULT_KEYS.items():
+            owner: dict[str, str] = {}
+            for action, names in actions.items():
+                for name in names:
+                    self.assertNotIn(name, owner, f"{mode}: {name} is on {owner.get(name)} and {action}")
+                    owner[name] = action
+
+    def test_normal_g_still_jumps_to_top(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, old = self.make_app(tmp, "# One\none\ntwo\nthree\n")
+            try:
+                app.row = len(app.lines) - 1
+                app.handle(ord("g"))
+                self.assertEqual(app.mode, "read")
+                self.assertEqual(app.row, 0)
+            finally:
+                self.restore_env(old)
+
+    def test_normal_ctrl_g_opens_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, old = self.make_app(tmp)
+            try:
+                app.handle(grimoire.parse_key("ctrl+g"))
+                self.assertEqual(app.mode, "graph")
+                self.assertEqual(app.graph_from, "read")
+            finally:
+                self.restore_env(old)
+
+    def restore_env(self, old):
+        if old is None:
+            os.environ.pop("GRIMOIRE_CONFIG", None)
+        else:
+            os.environ["GRIMOIRE_CONFIG"] = old
+
+    def test_esc_from_dirty_graph_page_returns_to_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, old = self.make_app(tmp)
+            try:
+                app.open_graph()
+                app.graph_open_selected()
+                self.assertEqual(app.mode, "read")
+                app.insert_text("x")
+                self.assertTrue(app.dirty)
+                app.handle(27)  # esc asks first
+                self.assertEqual(app.mode, "confirm")
+                app.handle(ord("d"))  # discard
+                self.assertEqual(app.mode, "graph")
+            finally:
+                self.restore_env(old)
+
+    def test_saved_graph_page_confirm_returns_to_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, old = self.make_app(tmp)
+            try:
+                app.open_graph()
+                app.graph_open_selected()
+                app.insert_text("x")
+                app.handle(27)
+                self.assertEqual(app.mode, "confirm")
+                app.handle(ord("s"))  # save
+                self.assertEqual(app.mode, "graph")
+            finally:
+                self.restore_env(old)
+
+    def test_settle_layout_honors_time_budget(self):
+        data = {"pages": self.pages({f"f{i%9}/p{i:04d}": {} for i in range(600)})}
+        data = self.connect(data)
+        nodes = grimoire.graph_nodes(data)
+        edges = grimoire.graph_links(data, nodes)
+        state = {
+            "pos": grimoire.seed_positions(sorted(nodes)),
+            "vel": {slug: (0.0, 0.0) for slug in nodes},
+            "edges": edges,
+            "links": grimoire.link_map(edges),
+        }
+        started = time.perf_counter()
+        grimoire.settle_layout(state, max_steps=5000, seconds=0.1)
+        elapsed = time.perf_counter() - started
+        self.assertTrue(state["settled"])
+        self.assertLess(elapsed, 2.0)
+
+    @classmethod
+    def connect(cls, data: dict) -> dict:
+        slugs = sorted(data["pages"])
+        for i, slug in enumerate(slugs[:-1]):
+            nxt = slugs[i + 1]
+            data["pages"][slug]["links"].append(nxt)
+            data["pages"][nxt]["backlinks"].append(slug)
+        return data
+
+    def test_settle_stops_when_the_graph_is_calm(self):
+        data = {"pages": self.pages({f"f{i%9}/p{i:04d}": {} for i in range(120)})}
+        data = self.connect(data)
+        nodes = grimoire.graph_nodes(data)
+        edges = grimoire.graph_links(data, nodes)
+        state = {
+            "pos": grimoire.seed_positions(sorted(nodes)),
+            "vel": {slug: (0.0, 0.0) for slug in nodes},
+            "edges": edges,
+            "links": grimoire.link_map(edges),
+        }
+        grimoire.settle_layout(state, max_steps=1500)
+        self.assertLessEqual(state["steps"], 1499)  # stopped on its own
+        per_node = state["moved"] / len(nodes)
+        self.assertLess(per_node, 0.003)
+
+    def test_place_cells_drops_off_screen_cells(self):
+        canvas: dict[tuple[int, int], int] = {}
+        grimoire.canvas_plot(canvas, -1, 0)   # left of the screen
+        grimoire.canvas_plot(canvas, 2, 0)    # on screen
+        runs = grimoire.place_cells(canvas, {}, [], 10)
+        self.assertEqual(runs, [(0, 1, "graph_edge", 1)])
+
+    def test_filter_with_no_matches_keeps_a_usable_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, old = self.make_app(tmp)
+            try:
+                app.open_graph()
+                app.handle(ord("/"))
+                app.gquery = "zzzz"
+                app.handle(grimoire.parse_key("enter"))
+                self.assertEqual(app.mode, "graph")
+                self.assertFalse(app.gstate["shown"])
+                self.assertEqual(app.message, "no pages match /zzzz")
+                app.handle(27)  # esc clears the filter
+                self.assertTrue(app.gstate["shown"])
+            finally:
+                self.restore_env(old)
 
 
 if __name__ == "__main__":
