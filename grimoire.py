@@ -25,6 +25,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+import termios
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -180,10 +182,62 @@ def write_default_theme(path: Path | None = None) -> Path:
     return dest
 
 
+def atomic_write(path: Path, data: bytes) -> None:
+    """A crash mid-write leaves the old file, not half of the new one.
+
+    Writes through a symlink to its target and keeps the old file's mode and owner.
+    A hard-linked file, or a folder we cannot make a temp file in, is written in place.
+    """
+    path = Path(os.path.realpath(path))
+    try:
+        old = path.stat()
+    except FileNotFoundError:
+        old = None
+    if old is not None and old.st_nlink > 1:
+        path.write_bytes(data)  # a new inode would cut the other links
+        return
+    try:
+        fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    except PermissionError:
+        path.write_bytes(data)
+        return
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if old is None:
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp, 0o666 & ~umask)
+        else:
+            os.chmod(tmp, old.st_mode & 0o7777)
+            if (old.st_uid, old.st_gid) != (os.getuid(), os.getgid()):
+                try:
+                    os.chown(tmp, old.st_uid, old.st_gid)
+                except PermissionError:
+                    pass
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    try:
+        folder = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(folder)
+    except OSError:
+        pass
+    finally:
+        os.close(folder)
+
+
 def save_config(cfg: dict[str, str]) -> Path:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    atomic_write(path, (json.dumps(cfg, indent=2) + "\n").encode("utf-8"))
     return path
 
 
@@ -261,7 +315,7 @@ def key_codes(name: str) -> set[int]:
 # ctrl+c always quits, even if this file never mentions it.
 DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
     "list": {
-        "quit": ["q"],
+        "quit": ["ctrl+q"],
         "back": ["esc", "left", "h"],
         "up": ["up", "k"],
         "down": ["down", "j"],
@@ -273,7 +327,7 @@ DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
     },
     "normal": {
         "leave": ["esc"],
-        "quit": ["q"],
+        "quit": ["ctrl+q"],
         "insert": ["i"],
         "append": ["a"],
         "up": ["up", "k"],
@@ -802,6 +856,7 @@ def links_in(text: str) -> list[str]:
     found: list[str] = []
     for match in re.finditer(r"\[\[([^\]|#]+)", text):
         found.append(match.group(1).strip())
+    text = re.sub(r"(?<!\\)!\[[^\]]*\]\([^)]*\)", "", text)  # images are not pages; [![b](b.png)](page.md) keeps its link
     for match in re.finditer(r"\[[^\]]*\]\(([^)]+)\)", text):
         target = match.group(1).strip().split("#", 1)[0]
         if target.startswith(REMOTE):
@@ -872,7 +927,7 @@ def graph_path(library: Path) -> Path:
 
 def write_graph(library: Path) -> Path:
     path = graph_path(library)
-    path.write_text(json.dumps(build_graph(library), indent=2) + "\n", encoding="utf-8")
+    atomic_write(path, (json.dumps(build_graph(library), indent=2) + "\n").encode("utf-8"))
     return path
 
 
@@ -1803,7 +1858,7 @@ class App:
         if text and getattr(self, "final_newline", True) and not text.endswith(newline):
             text += newline
         try:
-            self.path.write_bytes(text.encode("utf-8"))
+            atomic_write(self.path, text.encode("utf-8"))
         except OSError as exc:
             self.message = f"save failed: {exc}"
             return False
@@ -2782,7 +2837,14 @@ def page_file(slug: str, library: Path) -> Path:
     rel = Path(raw)
     if not raw or rel.is_absolute() or ".." in rel.parts or any(part.startswith(".") for part in rel.parts):
         raise ValueError(f"bad page {slug}")
-    path = (library / rel).with_suffix(".md").resolve()
+    base = library / rel
+    path = base.with_name(rel.name + ".md")  # with_suffix would turn v1.2 into v1.md
+    for suffix in (".md", ".markdown"):  # an existing notes.markdown is the page notes
+        found = base.with_name(rel.name + suffix)
+        if found.is_file():
+            path = found
+            break
+    path = path.resolve()
     path.relative_to(library.resolve())
     return path
 
@@ -2817,7 +2879,7 @@ def write_page(slug: str, text: str, cfg: dict[str, str] | None = None) -> dict[
     path.parent.mkdir(parents=True, exist_ok=True)
     if text and not text.endswith("\n"):
         text += "\n"
-    path.write_text(text, encoding="utf-8")
+    atomic_write(path, text.encode("utf-8"))
     write_graph(library)
     return {"slug": page_slug(path, library), "path": str(path)}
 
@@ -2926,13 +2988,16 @@ def serve_mcp() -> None:
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if "id" not in msg:
+        if not isinstance(msg, dict) or "id" not in msg:
             continue
         method = msg.get("method")
         mid = msg["id"]
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            params = {}
         if method == "initialize":
             result = {
-                "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2024-11-05"),
+                "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "grimoire", "version": "1.0.0"},
             }
@@ -2941,7 +3006,6 @@ def serve_mcp() -> None:
         elif method == "tools/list":
             result = {"tools": MCP_TOOLS}
         elif method == "tools/call":
-            params = msg.get("params") or {}
             try:
                 payload = mcp_result(str(params.get("name")), params.get("arguments") or {})
                 result = {"content": [{"type": "text", "text": json.dumps(payload)}], "isError": False}
@@ -2956,7 +3020,20 @@ def serve_mcp() -> None:
         sys.stdout.flush()
 
 
+def no_flow_control() -> None:
+    """ctrl+s and ctrl+q reach the app instead of pausing and resuming the terminal. endwin puts the shell's setting back."""
+    try:
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[0] &= ~termios.IXON
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        curses.def_prog_mode()  # coming back from ctrl+z keeps it off
+    except (termios.error, curses.error, OSError, ValueError):
+        pass
+
+
 def main(stdscr: curses.window, app: App) -> None:
+    no_flow_control()
     curses.curs_set(0)
     init_colors()
     stdscr.keypad(True)
