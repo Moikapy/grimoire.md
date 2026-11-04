@@ -289,6 +289,64 @@ class ParseTests(unittest.TestCase):
             self.assertEqual(app.col, len("06/01/2026,"))
             self.assertFalse(app.table_view())  # editing shows the raw line
 
+    def test_replace_cell_keeps_every_other_byte(self):
+        from grimoire import replace_cell
+        raw = '11/04/2026,12:36 PM,"a,b",851.31,'
+        self.assertEqual(replace_cell(raw, ",", 3, "900.00"), '11/04/2026,12:36 PM,"a,b",900.00,')
+        self.assertEqual(replace_cell(raw, ",", 2, "c,d"), '11/04/2026,12:36 PM,"c,d",851.31,')
+        self.assertEqual(replace_cell(raw, ",", 0, 'say "hi"'), '"say ""hi""",12:36 PM,"a,b",851.31,')
+        self.assertEqual(replace_cell("a,b", ",", 4, "z"), "a,b,,,z")  # short row gets padded
+        self.assertEqual(replace_cell("a\tb", "\t", 1, "x\ty"), 'a\t"x\ty"')
+        with self.assertRaises(ValueError):
+            replace_cell('a,"open', ",", 0, "x")
+
+    def test_cell_edit_commit_cancel_undo(self):
+        lines = ["Date,Upload,Server", "11/04/2026,851.31,Spectrum,", "06/01/2026,162.99,Spectrum"]
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._csv_app(tmp, lines)
+            app.handle_read(curses.KEY_RIGHT)
+            app.handle_read(10)  # enter opens the cell
+            self.assertEqual((app.mode, app.cell_text), ("cell", "851.31"))
+            for _ in range(6):
+                app.handle(127)
+            for ch in "900":
+                app.handle(ord(ch))
+            app.handle(27)  # esc changes nothing
+            self.assertEqual(app.lines[1], lines[1])
+            self.assertFalse(app.dirty)
+            app.handle(10)
+            for _ in range(6):
+                app.handle(127)
+            for ch in "1,000":
+                app.handle(ord(ch))
+            app.handle(10)
+            self.assertEqual(app.mode, "read")
+            self.assertEqual(app.lines[1], '11/04/2026,"1,000",Spectrum,')
+            self.assertEqual(app.lines[2], lines[2])
+            self.assertTrue(app.dirty)
+            self.assertEqual(app.table().cell(1, 1), "1,000")
+            app.handle(26)  # ctrl+z
+            self.assertEqual(app.lines, lines)
+            app.save()
+            self.assertEqual((Path(tmp) / "speed.csv").read_text(encoding="utf-8"), "\n".join(lines) + "\n")
+
+    def test_save_keeps_line_endings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for data in (b"a,b\r\n1,2\r\n", b"a,b\n1,2", b"# hi\n"):
+                path = Path(tmp) / "f.csv"
+                path.write_bytes(data)
+                app = App(Path(tmp), path)
+                app.save()
+                self.assertEqual(path.read_bytes(), data)
+
+    def test_multiline_cell_refuses_edit(self):
+        lines = ["a,b", '1,"starts here', 'ends here",2']
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._csv_app(tmp, lines)
+            app.handle_read(10)
+            self.assertEqual(app.mode, "read")
+            self.assertIn("multi-line", app.message)
+
     def test_plugin_renderer_beats_table_view(self):
         from grimoire import table_delimiter, PluginHost
         host = PluginHost()

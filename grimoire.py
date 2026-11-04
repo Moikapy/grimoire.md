@@ -550,6 +550,18 @@ def read_lines(path: Path) -> tuple[list[str], str]:
     return lines or [""], note
 
 
+def line_style(path: Path) -> tuple[str, bool]:
+    """The file's own line ending, and whether it ends with one. Saving keeps both."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return "\n", True
+    if not data:
+        return "\n", True
+    newline = "\r\n" if b"\r\n" in data else "\n"
+    return newline, data.endswith(b"\n")
+
+
 def split_row(raw: str, delimiter: str) -> list[str]:
     try:
         return next(csv.reader([raw], delimiter=delimiter))
@@ -571,6 +583,45 @@ def cell_offset(raw: str, delimiter: str, index: int) -> int:
             if seen == index:
                 return i + 1
     return len(raw)
+
+
+def cell_span(raw: str, delimiter: str, index: int) -> tuple[int, int] | None:
+    """Start and end of cell `index` in the raw line, quotes included. None if the row is shorter."""
+    start = 0
+    seen = 0
+    quoted = False
+    for i, ch in enumerate(raw):
+        if ch == '"':
+            quoted = not quoted
+        elif ch == delimiter and not quoted:
+            if seen == index:
+                return start, i
+            seen += 1
+            start = i + 1
+    if seen == index:
+        return start, len(raw)
+    return None
+
+
+def quote_cell(value: str, delimiter: str) -> str:
+    """Quote only when the value needs it: a delimiter, a quote, or a leading/trailing space."""
+    if delimiter in value or '"' in value or value != value.strip():
+        return '"' + value.replace('"', '""') + '"'
+    return value
+
+
+def replace_cell(raw: str, delimiter: str, index: int, value: str) -> str:
+    """Swap one cell. Every other byte of the line stays as it was."""
+    if raw.count('"') % 2:
+        raise ValueError("multi-line cell, use i to edit raw")
+    span = cell_span(raw, delimiter, index)
+    if span is None:
+        count = 1
+        while cell_span(raw, delimiter, count) is not None:
+            count += 1
+        return raw + delimiter * (index - count + 1) + quote_cell(value, delimiter)
+    start, end = span
+    return raw[:start] + quote_cell(value, delimiter) + raw[end:]
 
 
 def is_number(text: str) -> bool:
@@ -1438,6 +1489,7 @@ def help_lines(name: str, keys: KeyMap | None = None) -> tuple[str, ...]:
         f"  {bound.show('normal', 'view')}   view the image on this line",
         f"  {bound.show('normal', 'append')}   append, then type",
         f"  {bound.show('normal', 'record')}   .csv/.tsv: grid or one record at a time",
+        f"  {bound.show('normal', 'view')}   .csv/.tsv: edit the cell; {bound.show('normal', 'insert')} edits the raw line",
         f"  {bound.show('normal', 'leave')} {bound.show('normal', 'quit')}   back, asks if unsaved",
         "",
         "Reader, insert",
@@ -1501,6 +1553,7 @@ class App:
         self.delimiter: str | None = None
         self.tcol = 0
         self.record = False
+        self.cell_text = ""
         self._table: tuple[tuple[str, ...], Table] | None = None
         self.backlinks: list[str] = []
         self.undo: list[tuple[list[str], int, int]] = []
@@ -1551,6 +1604,7 @@ class App:
 
     def open_path(self, path: Path) -> None:
         self.lines, self.note = read_lines(path)
+        self.newline, self.final_newline = line_style(path)
         self.fences = fence_flags(self.lines)
         self.path = path
         self.markdown = path.suffix.lower() in MARKDOWN_EXT
@@ -1590,6 +1644,47 @@ class App:
 
     def table_view(self) -> bool:
         return self.delimiter is not None and not self.inserting and self.mode != "search"
+
+    def begin_cell_edit(self) -> None:
+        table = self.table()
+        if table is None:
+            return
+        if self.lines[self.row].count('"') % 2:
+            self.message = "multi-line cell, use i to edit raw"
+            return
+        self.cell_text = table.cell(self.row, self.tcol)
+        self.mode = "cell"
+        self.message = ""
+
+    def commit_cell(self) -> None:
+        self.mode = "read"
+        table = self.table()
+        if table is None or self.cell_text == table.cell(self.row, self.tcol):
+            return
+        try:
+            new = replace_cell(self.lines[self.row], self.delimiter or ",", self.tcol, self.cell_text)
+        except ValueError as exc:
+            self.message = str(exc)
+            return
+        self._coalesce = None
+        self.checkpoint("cell")
+        self._coalesce = None
+        self.lines[self.row] = new
+        self.col = cell_offset(new, self.delimiter or ",", self.tcol)
+        self.touch()
+
+    def handle_cell(self, key: int | str) -> bool:
+        if self.keys.pressed("search", "cancel", key):
+            self.mode = "read"
+            return True
+        if self.keys.pressed("search", "jump", key):
+            self.commit_cell()
+            return True
+        if self.keys.pressed("search", "erase", key):
+            self.cell_text = self.cell_text[:-1]
+        elif isinstance(key, int) and 32 <= key < 127:
+            self.cell_text += chr(key)
+        return True
 
     def move_cell(self, drow: int, dcol: int) -> None:
         table = self.table()
@@ -1703,11 +1798,12 @@ class App:
         if self.path is None:
             self.message = "no file"
             return False
-        text = "\n".join(self.lines)
-        if text and not text.endswith("\n"):
-            text += "\n"
+        newline = getattr(self, "newline", "\n")
+        text = newline.join(self.lines)
+        if text and getattr(self, "final_newline", True) and not text.endswith(newline):
+            text += newline
         try:
-            self.path.write_text(text, encoding="utf-8")
+            self.path.write_bytes(text.encode("utf-8"))
         except OSError as exc:
             self.message = f"save failed: {exc}"
             return False
@@ -1804,6 +1900,8 @@ class App:
             return True
         if self.mode == "search":
             return self.handle_search(key)
+        if self.mode == "cell":
+            return self.handle_cell(key)
         if self.mode == "confirm":
             return self.handle_confirm(key)
         if self.mode == "name":
@@ -1888,6 +1986,9 @@ class App:
                 return True
             if self.keys.pressed("normal", "line_end", key):
                 self.move_cell(0, 10_000) if not self.record else self.move_cell(10_000, 0)
+                return True
+            if self.keys.pressed("normal", "view", key) and table is not None:
+                self.begin_cell_edit()
                 return True
             if self.keys.pressed("normal", "record", key) and table is not None:
                 self.record = not self.record
@@ -2271,6 +2372,10 @@ def bar_spec(app: App) -> tuple[list[str], str, str]:
         return parts, "", right
     if app.mode == "search":
         return ["/" + app.query], keys.show("normal", "help"), right
+    if app.mode == "cell":
+        table = app.table()
+        label = table.header(app.tcol) if table else "cell"
+        return [f"{label}: {app.cell_text}▏", "enter keep", "esc cancel"], "", ""
     if app.inserting:
         return [
             "insert",
@@ -2288,7 +2393,8 @@ def bar_spec(app: App) -> tuple[list[str], str, str]:
         parts = [
             app.message or ("unsaved" if app.dirty else here),
             key_hint(keys, "normal", "record", "grid" if app.record else "record"),
-            key_hint(keys, "normal", "insert", "edit"),
+            key_hint(keys, "normal", "view", "edit"),
+            key_hint(keys, "normal", "insert", "raw"),
             key_hint(keys, "normal", "leave", "back"),
             key_hint(keys, "normal", "help", "keys"),
         ]
