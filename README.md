@@ -51,6 +51,22 @@ Colors are `~/.grimoire/theme.json`. `grimoire theme` writes it if it is missing
 
 Plugins are plain Python files in `~/.grimoire/plugins`. Each one defines `register(api)`. Core keys win. A handler returns False to quit the app. `grimoire plugins` lists what loaded. Copy `examples/linecount.py` there to try one: ctrl+w reports the line count.
 
+## Graph
+
+`g` on the shelf opens the graph of the whole library. `g` on a page opens it with that page selected. Pages that link to nothing still sit on their own: every node repels the others, links act as springs, and a little gravity pulls the whole thing to the middle. The same library settles in the same shape every time.
+
+The picture is drawn with braille dots, two per column and four per row, so lines stay lines. Each folder gets one color from the theme (`graph_1` to `graph_8`, in sorted folder order; top-level pages are their own group) and each link is a dim line. Color roles go in `~/.grimoire/theme.json` like the rest. The selected page and its neighbors get bold labels and bright edges; other labels appear when they fit. Arrow keys or `hjkl` move the selection to the nearest node in that direction. Enter opens the page, and Esc on the page returns to the graph, Esc in the graph returns to where you came from. The node's size grows with its link count.
+
+`+` and `-` zoom, `0` re-fits the whole graph, and `w a s d` pans. Labels fade like in Obsidian: zoomed out you see only the selected page and its neighbors, zoomed in you see more. The mouse works too: click to select, click the same node again or double-click to open it, scroll wheel zooms around the pointer. Without a mouse everything still works from the keys.
+
+`L` turns on the local graph: only the nodes within N link-steps of the selected page, in either direction. `[` and `]` change N from 1 to 5, and turning L off brings the whole graph back. The footer says `local, depth N`.
+
+Links to pages that do not exist show as hollow dim nodes with the raw link text as the label when selected. `m` hides them, `m` again shows them.
+
+`/` filters: type a few letters, and only pages with those letters in the slug or the title stay, with the edges between them. Esc clears the filter. ? lists the graph keys.
+
+Physics is O(n^2) per step, so a few hundred nodes animate at a comfortable pace; above 400 nodes the graph settles before the first draw instead. Node dragging with the mouse is not supported.
+
 ## Images
 
 A line that is only `![alt](path.png)` shows the alt text and the path. The cursor line stays the raw markdown. Nothing is downloaded. A web address stays text.

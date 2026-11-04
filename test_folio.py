@@ -727,6 +727,53 @@ class GraphTests(unittest.TestCase):
         self.assertAlmostEqual(panned["cx"], -1.0)
         self.assertEqual(view, {"cx": 0.0, "cy": 0.0, "z": 10.0, "zfit": 10.0})
 
+    def test_local_missing_and_filter(self):
+        data = {
+            "pages": self.pages({
+                "a": {"title": "Alpha", "links": ["b", "ghost"], "missing": ["ghost"], "backlinks": []},
+                "b": {"title": "Beta", "links": ["a"], "backlinks": ["a"]},
+                "c": {"title": "Gamma", "links": ["b"], "backlinks": []},
+            })
+        }
+        nodes, edges = grimoire.graph_subset(data, "a", None, True, "")
+        self.assertEqual(set(nodes), {"a", "b", "c", grimoire.MISSING_MARK + "ghost"})
+        slim, _ = grimoire.graph_subset(data, "a", 1, True, "")
+        self.assertEqual(set(slim), {"a", "b", grimoire.MISSING_MARK + "ghost"})
+        nomiss, _ = grimoire.graph_subset(data, "a", None, False, "")
+        self.assertNotIn(grimoire.MISSING_MARK + "ghost", nomiss)
+        hit, edges_hit = grimoire.graph_subset(data, "a", None, True, "beta")
+        self.assertEqual(set(hit), {"b"})
+        self.assertEqual(edges_hit, [])
+
+    def test_app_local_and_missing_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            library = root / "pages"
+            library.mkdir()
+            (library / "index.md").write_text("# Index\n\nSee [[beta]] and [[void]].\n", encoding="utf-8")
+            (library / "beta.md").write_text("# Beta\n\nBack to [[index]].\n", encoding="utf-8")
+            cfg_path = root / "cfg.json"
+            cfg_path.write_text(json.dumps({"name": "GRIMOIRE", "open": "library", "library": str(library)}), encoding="utf-8")
+            os.environ["GRIMOIRE_CONFIG"] = str(cfg_path)
+            try:
+                app = App(root)
+                app.handle(ord("g"))
+                bar = grimoire.bar_spec(app)
+                self.assertFalse(any("depth" in part for part in bar[0]))
+                app.handle(ord("L"))
+                self.assertEqual(app.glocal, 1)
+                self.assertTrue(app.handle(ord("]")))
+                self.assertEqual(app.glocal, 2)
+                self.assertTrue(app.handle(ord("[")))
+                self.assertEqual(app.glocal, 1)
+                footer = grimoire.bar_spec(app)
+                self.assertIn("depth 1", " ".join(list(footer[0]) + list(footer[2:])))
+                self.assertTrue(app.handle(ord("m")))
+                self.assertFalse(app.gmissing)
+                self.assertNotIn(grimoire.MISSING_MARK + "void", app.gstate["shown"])
+            finally:
+                os.environ.pop("GRIMOIRE_CONFIG", None)
+
 
 def math_dist(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5

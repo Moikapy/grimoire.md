@@ -27,6 +27,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -322,11 +323,21 @@ DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
         "zoom_in": ["+", "="],
         "zoom_out": ["-"],
         "fit": ["0"],
-        "pan_left": ["H"],
-        "pan_right": ["L"],
-        "pan_up": ["K"],
-        "pan_down": ["J"],
+        "pan_left": ["a"],
+        "pan_right": ["d"],
+        "pan_up": ["w"],
+        "pan_down": ["s"],
+        "local_depth": ["L"],
+        "depth_up": ["]"],
+        "depth_down": ["["],
+        "missing": ["m"],
+        "filter": ["/"],
         "help": ["?", "f1"],
+    },
+    "gfilter": {
+        "cancel": ["esc"],
+        "accept": ["enter"],
+        "erase": ["backspace"],
     },
     "insert": {
         "normal": ["esc"],
@@ -1544,6 +1555,9 @@ def help_lines(name: str, keys: KeyMap | None = None) -> tuple[str, ...]:
         f"  {bound.show('graph', 'leave')}   back; from the page it returns here",
         f"  {bound.show('graph', 'zoom_in')} {bound.show('graph', 'zoom_out')} zoom   {bound.show('graph', 'fit')} re-fit",
         f"  {bound.show('graph', 'pan_left')} {bound.show('graph', 'pan_down')} {bound.show('graph', 'pan_up')} {bound.show('graph', 'pan_right')}   pan",
+        f"  {bound.show('graph', 'local_depth')}   local graph   {bound.show('graph', 'depth_down')} {bound.show('graph', 'depth_up')} depth 1..5",
+        f"  {bound.show('graph', 'missing')}   show or hide missing pages",
+        f"  {bound.show('graph', 'filter')}   keep pages, {bound.show('graph', 'leave')} clears it",
         "  mouse   click to select, again to open, wheel zooms",
         f"  ctrl+c  quit    {bound.show('graph', 'quit')} quits",
         "",
@@ -1963,6 +1977,8 @@ class App:
             return self.handle_filter(key)
         if self.mode == "graph":
             return self.handle_graph(key)
+        if self.mode == "gfilter":
+            return self.handle_gfilter(key)
         if self.mode == "list":
             return self.handle_list(key)
         return self.handle_read(key)
@@ -2288,7 +2304,8 @@ class App:
             return
         nodes, edges = graph_subset(self.gdata, self.gsel, self.glocal, self.gmissing, self.gfilter)
         if self.gsel not in nodes:
-            self.gsel = graph_home({k: v for k, v in self.gdata["pages"].items() if k in nodes}, "") if self.gdata["pages"] else ""
+            keep_pages = {key: value for key, value in self.gdata["pages"].items() if key in nodes}
+            self.gsel = graph_home({"pages": keep_pages}, "") if keep_pages else ""
         old = (self.gstate or {}).get("pos", {})
         pos = {slug: old[slug] for slug in nodes if slug in old}
         pos.update({slug: xy for slug, xy in seed_positions(sorted(set(nodes) - set(pos))).items()})
@@ -2308,11 +2325,19 @@ class App:
         return True
 
     def step_graph(self) -> None:
+        """Batch physics steps to use most of the 33 ms frame, then redraw."""
         st = self.gstate
         if st is None or st.get("settled"):
             return
-        if step_layout(st) < 0.01:
-            st["settled"] = True
+        budget = time.perf_counter() + 0.02
+        for _ in range(30):
+            if step_layout(st) < 0.01:
+                st["settled"] = True
+                if self.gview is not None and self.gview.get("auto"):
+                    self.gview = None
+                break
+            if time.perf_counter() >= budget:
+                break
 
     def graph_open_selected(self) -> bool:
         nodes = self.gshown["nodes"]
@@ -2329,6 +2354,10 @@ class App:
         if self.keys.pressed("graph", "quit", key):
             return False
         if self.keys.pressed("graph", "leave", key):
+            if self.gfilter:
+                self.gfilter = ""
+                self.graph_refresh()
+                return True
             return self.close_graph()
         if self.keys.pressed("graph", "open", key):
             return self.graph_open_selected()
@@ -2336,6 +2365,10 @@ class App:
             self.help_from = "graph"
             self.help_at = 0
             self.mode = "help"
+            return True
+        if self.keys.pressed("graph", "filter", key):
+            self.gquery = ""
+            self.mode = "gfilter"
             return True
         moves = {"select_up": (0, -1), "select_down": (0, 1), "select_left": (-1, 0), "select_right": (1, 0)}
         for action, vector in moves.items():
@@ -2360,6 +2393,26 @@ class App:
         if self.keys.pressed("graph", "fit", key):
             self.gview = None
             return True
+        if self.keys.pressed("graph", "local_depth", key):
+            if self.glocal is None:
+                self.glocal = 1
+            else:
+                self.glocal = min(5, self.glocal + 1) if self.glocal < 5 else None
+            self.graph_refresh()
+            return True
+        if self.keys.pressed("graph", "depth_up", key):
+            self.glocal = min(5, (self.glocal or 0) + 1)
+            self.graph_refresh()
+            return True
+        if self.keys.pressed("graph", "depth_down", key):
+            depth = (self.glocal or 1) - 1
+            self.glocal = depth if depth >= 1 else None
+            self.graph_refresh()
+            return True
+        if self.keys.pressed("graph", "missing", key):
+            self.gmissing = not self.gmissing
+            self.graph_refresh()
+            return True
         return True
 
     def graph_move(self, vector: tuple[int, int]) -> None:
@@ -2373,6 +2426,24 @@ class App:
         if self.gsel not in screen:
             return
         self.gsel = cone_pick(screen, self.gsel, vector)
+
+    def handle_gfilter(self, key: int | str) -> bool:
+        if self.keys.pressed("gfilter", "cancel", key):
+            self.gquery = ""
+            self.mode = "graph"
+            return True
+        if self.keys.pressed("gfilter", "accept", key):
+            self.gfilter = self.gquery
+            self.graph_refresh()
+            self.gquery = ""
+            self.mode = "graph"
+            return True
+        if self.keys.pressed("gfilter", "erase", key):
+            self.gquery = self.gquery[:-1]
+            return True
+        if isinstance(key, int) and 32 <= key < 127:
+            self.gquery += chr(key)
+        return True
 
     def graph_mouse(self) -> bool:
         try:
@@ -2561,7 +2632,7 @@ def fit_view(pos: dict, cols: int, rows: int, pad: float = 4.0) -> dict:
     span_x = max(0.001, max(xs) - min(xs))
     span_y = max(0.001, max(ys) - min(ys))
     z = max(0.001, min((w - 2 * pad) / span_x, (h - 2 * pad) / span_y))
-    return {"cx": (min(xs) + max(xs)) / 2, "cy": (min(ys) + max(ys)) / 2, "z": z, "zfit": z}
+    return {"cx": (min(xs) + max(xs)) / 2, "cy": (min(ys) + max(ys)) / 2, "z": z, "zfit": z, "auto": True}
 
 
 def project(x: float, y: float, view: dict, cols: int, rows: int) -> tuple[float, float]:
@@ -2633,23 +2704,28 @@ def canvas_line(canvas: dict, x0: float, y0: float, x1: float, y1: float) -> set
     return touched
 
 
-def canvas_disc(canvas: dict, dx: float, dy: float, radius: float) -> None:
-    """Filled dot cluster. The size scales with degree, like Obsidian."""
+def canvas_disc(canvas: dict, dx: float, dy: float, radius: float) -> list[tuple[int, int]]:
+    """Filled dot cluster sized by degree, like Obsidian. Returns its cells."""
     span = max(1, int(radius) + 1)
+    touched: list[tuple[int, int]] = []
     for iy in range(int(dy) - span, int(dy) + span + 1):
         for ix in range(int(dx) - span, int(dx) + span + 1):
             if (ix - dx) ** 2 + (iy - dy) ** 2 <= radius * radius:
                 canvas_plot(canvas, ix, iy)
+                touched.append((int(ix) // 2, int(iy) // 4))
+    return touched
 
 
-def canvas_ring(canvas: dict, dx: float, dy: float, radius: float) -> None:
-    """Hollow dot circle for a page that does not exist."""
+def canvas_ring(canvas: dict, dx: float, dy: float, radius: float) -> list[tuple[int, int]]:
+    """Hollow dot circle for a page that does not exist. Returns its cells."""
     span = max(1, int(radius) + 1)
+    touched: list[tuple[int, int]] = []
     for iy in range(int(dy) - span, int(dy) + span + 1):
         for ix in range(int(dx) - span, int(dx) + span + 1):
-            dist = math.hypot(ix - dx, iy - dy)
-            if abs(dist - radius) <= 0.9:
+            if abs(math.hypot(ix - dx, iy - dy) - radius) <= 0.9:
                 canvas_plot(canvas, ix, iy)
+                touched.append((int(ix) // 2, int(iy) // 4))
+    return touched
 
 
 def canvas_rows(canvas: dict, cols: int, rows: int) -> list[str]:
@@ -2799,8 +2875,7 @@ def graph_raster(
     """Braille bit cells plus one style per cell. Edges first, nodes on top."""
     canvas: dict[tuple[int, int], int] = {}
     styles: dict[tuple[int, int], str] = {}
-    edges = st["edges"]
-    for a, b in edges:
+    for a, b in st["edges"]:
         first = screen.get(a)
         second = screen.get(b)
         if first is None or second is None:
@@ -2813,23 +2888,12 @@ def graph_raster(
         at = screen.get(slug)
         if at is None:
             continue
-        style = colors[slug]
         if node["missing"]:
-            canvas_ring(canvas, *at, node_radius(node))
+            cells = canvas_ring(canvas, *at, node_radius(node))
         else:
-            canvas_disc(canvas, *at, node_radius(node))
-        cells = [
-            (cx, cy)
-            for cx, cy in canvas
-            if (cx * 2 - at[0]) ** 2 / 4 + (cy * 4 - at[1]) ** 2 / 16 <= (node_radius(node) + 1) ** 2
-            and cx * 2 >= at[0] - node_radius(node) - 2
-            and cx * 2 <= at[0] + node_radius(node) + 2
-            and cy * 4 >= at[1] - node_radius(node) - 2
-            and cy * 4 <= at[1] + node_radius(node) + 2
-            and styles.get((cx, cy)) != "graph_edge_hi"
-        ]
+            cells = canvas_disc(canvas, *at, node_radius(node))
         for cell in cells:
-            styles[cell] = style
+            styles[cell] = colors[slug]
     return canvas, styles
 
 
@@ -3050,6 +3114,8 @@ def bar_spec(app: App) -> tuple[list[str], str, str]:
         return [f"new {kind}: {app.query}", "enter make", "esc cancel"], "", ""
     if app.mode == "filter":
         return [f"/{app.query}", "enter open", "esc cancel"], "", ""
+    if app.mode == "gfilter":
+        return [f"/{app.gquery}", "enter keep", "esc cancel"], "", ""
     if app.mode == "graph":
         node = {}
         if app.gshown:
@@ -3080,6 +3146,9 @@ def bar_spec(app: App) -> tuple[list[str], str, str]:
             "enter open",
             key_hint(keys, "graph", "leave", "back"),
             f"{keys.show('graph', 'zoom_in')} {keys.show('graph', 'zoom_out')} zoom",
+            key_hint(keys, "graph", "local_depth", "local"),
+            key_hint(keys, "graph", "missing", "missing"),
+            key_hint(keys, "graph", "filter", "filter"),
             key_hint(keys, "graph", "help", "keys"),
             key_hint(keys, "graph", "quit", "quit"),
         ]
