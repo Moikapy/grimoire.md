@@ -19,7 +19,10 @@ import importlib.util
 import json
 import locale
 import os
+import re
+import shutil
 import signal
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,7 +37,9 @@ TEXT_EXT = {
     ".rs", ".toml", ".yaml", ".yml", ".json", ".css", ".html",
     ".conf", ".ini", ".service", ".desktop",
 }
-MARKDOWN_EXT = {".md", ".markdown"}
+MD_SUFFIXES = (".markdown", ".md")
+MARKDOWN_EXT = set(MD_SUFFIXES)
+REMOTE = ("http://", "https://", "mailto:")
 SKIP_DIRS = {"__pycache__", "node_modules", "dist", "build", ".venv", "venv"}
 MAX_LINES = 8000
 CARD_W = 60
@@ -45,6 +50,7 @@ HEADING = "heading"
 BOLD = "bold"
 ITALIC = "italic"
 CODE = "code"
+LINK = "link"
 FOLDER = "folder"
 SELECTED = "selected"
 DIM = "dim"
@@ -70,7 +76,7 @@ def config_path() -> Path:
 
 
 def default_config() -> dict[str, str]:
-    return {"name": "GRIMOIRE", "open": "cwd", "library": "~/scripts"}
+    return {"name": "GRIMOIRE", "open": "library", "library": "~/.grimoire/pages"}
 
 
 def load_config() -> dict[str, str]:
@@ -94,6 +100,81 @@ def load_config() -> dict[str, str]:
     elif os.environ.get("FOLIO_DIR"):
         cfg["library"] = os.environ["FOLIO_DIR"]
     return cfg
+
+
+NAMED_COLORS = {
+    "black": 0,
+    "red": 1,
+    "green": 2,
+    "yellow": 3,
+    "blue": 4,
+    "magenta": 5,
+    "cyan": 6,
+    "white": 7,
+}
+DEFAULT_THEME = {
+    "text": "default",
+    "title": "blue",
+    "heading": "blue",
+    "bold": "blue",
+    "italic": "green",
+    "code": "cyan",
+    "link": "cyan",
+    "folder": "magenta",
+    "footer": "default",
+}
+THEME_PAIRS: dict[str, int] = {}
+
+
+def theme_path() -> Path:
+    override = os.environ.get("GRIMOIRE_THEME")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".grimoire" / "theme.json"
+
+
+def color_index(name: str) -> int | None:
+    key = name.strip().lower()
+    if key in ("", "default"):
+        return None
+    if key in NAMED_COLORS:
+        return NAMED_COLORS[key]
+    if key.isdigit():
+        return int(key)
+    raise ValueError(key)
+
+
+def load_theme() -> dict[str, str]:
+    theme = dict(DEFAULT_THEME)
+    path = theme_path()
+    if not path.is_file():
+        return theme
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"grimoire: ignoring {path} ({exc})", file=sys.stderr)
+        return theme
+    if not isinstance(data, dict):
+        print(f"grimoire: ignoring {path}", file=sys.stderr)
+        return theme
+    for role in DEFAULT_THEME:
+        value = data.get(role)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            color_index(value)
+        except ValueError:
+            print(f"grimoire: theme {role}: unknown color {value}", file=sys.stderr)
+            continue
+        theme[role] = value.strip().lower()
+    return theme
+
+
+def write_default_theme(path: Path | None = None) -> Path:
+    dest = path or theme_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(DEFAULT_THEME, indent=2) + "\n", encoding="utf-8")
+    return dest
 
 
 def save_config(cfg: dict[str, str]) -> Path:
@@ -122,9 +203,30 @@ def plugins_dir() -> Path:
 
 
 def parse_key(name: str) -> int:
-    key = name.lower().strip()
+    raw = name.strip()
+    if len(raw) == 1:
+        return ord(raw)
+    key = raw.lower()
     if key in ("esc", "escape"):
         return 27
+    if key in ("enter", "return"):
+        return 10
+    if key in ("backspace", "bs"):
+        return 127
+    if key == "tab":
+        return 9
+    if key in ("pgup", "pageup"):
+        return curses.KEY_PPAGE
+    if key in ("pgdn", "pagedown", "pgdown"):
+        return curses.KEY_NPAGE
+    if key in ("delete", "del"):
+        return curses.KEY_DC
+    if key == "home":
+        return curses.KEY_HOME
+    if key == "end":
+        return curses.KEY_END
+    if key == "space":
+        return ord(" ")
     if key.startswith("ctrl+") and len(key) == 6 and key[-1].isalpha():
         return ord(key[-1]) & 0x1F
     if key.startswith("f") and key[1:].isdigit():
@@ -139,9 +241,187 @@ def parse_key(name: str) -> int:
     }
     if key in arrows:
         return arrows[key]
-    if len(key) == 1:
-        return ord(key)
     raise ValueError(f"unknown key {name}")
+
+
+def key_codes(name: str) -> set[int]:
+    """One name can be several bytes. Enter and backspace are not one code."""
+    key = name.strip().lower()
+    if key in ("enter", "return"):
+        return {10, 13, curses.KEY_ENTER}
+    if key in ("backspace", "bs"):
+        return {curses.KEY_BACKSPACE, 127, 8}
+    return {parse_key(name)}
+
+
+# Action names are fixed. The file only changes which keys fire them.
+# ctrl+c always quits, even if this file never mentions it.
+DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
+    "list": {
+        "quit": ["q"],
+        "back": ["esc", "left", "h"],
+        "up": ["up", "k"],
+        "down": ["down", "j"],
+        "open": ["enter", "right", "l"],
+        "new_page": ["n"],
+        "new_folder": ["N"],
+        "find": ["/"],
+        "help": ["?", "f1"],
+    },
+    "normal": {
+        "leave": ["esc"],
+        "quit": ["q"],
+        "insert": ["i"],
+        "append": ["a"],
+        "up": ["up", "k"],
+        "down": ["down", "j"],
+        "left": ["left", "h"],
+        "right": ["right", "l"],
+        "line_start": ["home", "0"],
+        "line_end": ["end", "$"],
+        "top": ["g"],
+        "bottom": ["G"],
+        "page_up": ["pgup"],
+        "page_down": ["pgdn"],
+        "save": ["f2", "ctrl+s"],
+        "reload": ["f5"],
+        "help": ["f1"],
+        "find": ["/", "ctrl+f"],
+        "find_next": ["ctrl+n"],
+        "find_prev": ["ctrl+p"],
+        "view": ["enter", "o"],
+        "undo": ["ctrl+z"],
+        "redo": ["ctrl+y"],
+    },
+    "insert": {
+        "normal": ["esc"],
+        "up": ["up"],
+        "down": ["down"],
+        "left": ["left"],
+        "right": ["right"],
+        "line_start": ["home"],
+        "line_end": ["end"],
+        "page_up": ["pgup"],
+        "page_down": ["pgdn"],
+        "save": ["f2", "ctrl+s"],
+        "reload": ["f5"],
+        "help": ["f1"],
+        "undo": ["ctrl+z"],
+        "redo": ["ctrl+y"],
+        "backspace": ["backspace"],
+        "delete": ["delete"],
+        "break": ["enter"],
+        "indent": ["tab"],
+    },
+    "confirm": {
+        "yes": ["s", "y", "S", "Y"],
+        "no": ["d", "n", "D", "N"],
+        "stay": ["esc"],
+    },
+    "search": {
+        "cancel": ["esc"],
+        "jump": ["enter"],
+        "erase": ["backspace"],
+    },
+    "name": {
+        "cancel": ["esc"],
+        "accept": ["enter"],
+        "erase": ["backspace"],
+    },
+    "filter": {
+        "cancel": ["esc"],
+        "open": ["enter"],
+        "erase": ["backspace"],
+        "up": ["up"],
+        "down": ["down"],
+    },
+    "help": {
+        "close": ["esc", "q", "?", "f1"],
+        "up": ["up", "k"],
+        "down": ["down", "j"],
+    },
+}
+
+
+class KeyMap:
+    def __init__(self, labels: dict[str, dict[str, list[str]]], codes: dict[str, dict[str, set[int]]]) -> None:
+        self.labels = labels
+        self.codes = codes
+
+    def pressed(self, mode: str, action: str, key: int | str) -> bool:
+        if not isinstance(key, int):
+            return False
+        return key in self.codes.get(mode, {}).get(action, ())
+
+    def show(self, mode: str, action: str) -> str:
+        names = self.labels.get(mode, {}).get(action) or ["?"]
+        return " ".join(names[:3])
+
+
+def keys_path() -> Path:
+    override = os.environ.get("GRIMOIRE_KEYS")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".grimoire" / "keys.json"
+
+
+def compile_keys(data: dict) -> KeyMap:
+    labels = {
+        mode: {action: list(names) for action, names in actions.items()}
+        for mode, actions in DEFAULT_KEYS.items()
+    }
+    if isinstance(data, dict):
+        for mode, actions in data.items():
+            if mode not in DEFAULT_KEYS or not isinstance(actions, dict):
+                print(f"grimoire: ignoring keys section {mode}", file=sys.stderr)
+                continue
+            for action, names in actions.items():
+                if action not in DEFAULT_KEYS[mode]:
+                    print(f"grimoire: ignoring {mode}.{action}", file=sys.stderr)
+                    continue
+                if isinstance(names, str):
+                    names = [names]
+                if not isinstance(names, list) or not all(isinstance(item, str) and item.strip() for item in names):
+                    print(f"grimoire: ignoring {mode}.{action}", file=sys.stderr)
+                    continue
+                labels[mode][action] = [item.strip() for item in names]
+    codes: dict[str, dict[str, set[int]]] = {}
+    for mode, actions in labels.items():
+        codes[mode] = {}
+        for action, names in actions.items():
+            bag: set[int] = set()
+            for name in names:
+                try:
+                    bag |= key_codes(name)
+                except ValueError as exc:
+                    print(f"grimoire: {mode}.{action}: {exc}", file=sys.stderr)
+            if not bag:
+                labels[mode][action] = list(DEFAULT_KEYS[mode][action])
+                for name in labels[mode][action]:
+                    bag |= key_codes(name)
+            codes[mode][action] = bag
+    return KeyMap(labels, codes)
+
+
+def load_keys() -> KeyMap:
+    path = keys_path()
+    data: dict = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"grimoire: ignoring {path} ({exc})", file=sys.stderr)
+            loaded = {}
+        if isinstance(loaded, dict):
+            data = loaded
+    return compile_keys(data)
+
+
+def write_default_keys(path: Path | None = None) -> Path:
+    dest = path or keys_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(DEFAULT_KEYS, indent=2) + "\n", encoding="utf-8")
+    return dest
 
 
 class PluginAPI:
@@ -266,6 +546,124 @@ def read_lines(path: Path) -> tuple[list[str], str]:
     return lines or [""], note
 
 
+def page_slug(path: Path, library: Path) -> str:
+    rel = path.resolve().relative_to(library.resolve()).as_posix()
+    return strip_suffix(rel)
+
+
+def list_pages(library: Path) -> dict[str, Path]:
+    found: dict[str, Path] = {}
+    if not library.is_dir():
+        return found
+    for path in sorted(library.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in MARKDOWN_EXT:
+            continue
+        parts = path.relative_to(library).parts
+        if any(part.startswith(".") for part in parts):
+            continue
+        found[page_slug(path, library).lower()] = path
+    return found
+
+
+def links_in(text: str) -> list[str]:
+    text = re.sub(r"```.*?```", "", text, flags=re.S)
+    text = re.sub(r"`[^`\n]*`", "", text)
+    found: list[str] = []
+    for match in re.finditer(r"\[\[([^\]|#]+)", text):
+        found.append(match.group(1).strip())
+    for match in re.finditer(r"\[[^\]]*\]\(([^)]+)\)", text):
+        target = match.group(1).strip().split("#", 1)[0]
+        if target.startswith(REMOTE):
+            continue
+        target = strip_suffix(target).removeprefix("./").strip()
+        if target:
+            found.append(target)
+    return found
+
+
+def _unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def page_title(path: Path, slug: str) -> str:
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("#"):
+                return line.lstrip("#").strip() or slug
+    except OSError:
+        pass
+    return slug
+
+
+def build_graph(library: Path) -> dict:
+    pages = list_pages(library)
+    nodes: dict[str, dict] = {}
+    for key, path in pages.items():
+        slug = page_slug(path, library)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        resolved: list[str] = []
+        missing: list[str] = []
+        for link in links_in(text):
+            hit = pages.get(link.lower().replace("\\", "/"))
+            if hit is None:
+                missing.append(link)
+            else:
+                resolved.append(page_slug(hit, library))
+        nodes[slug] = {
+            "path": str(path),
+            "title": page_title(path, slug),
+            "links": _unique(resolved),
+            "missing": _unique(missing),
+            "backlinks": [],
+        }
+    for slug, node in nodes.items():
+        for dest in node["links"]:
+            if dest in nodes:
+                nodes[dest]["backlinks"].append(slug)
+    for node in nodes.values():
+        node["backlinks"] = _unique(node["backlinks"])
+    return {"library": str(library.resolve()), "pages": nodes}
+
+
+def graph_path(library: Path) -> Path:
+    return library / ".graph.json"
+
+
+def write_graph(library: Path) -> Path:
+    path = graph_path(library)
+    path.write_text(json.dumps(build_graph(library), indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def refresh_graph_for(path: Path) -> None:
+    library = library_path(load_config())
+    try:
+        path.resolve().relative_to(library.resolve())
+    except ValueError:
+        return
+    write_graph(library)
+
+
+def backlinks_for(path: Path) -> list[str]:
+    library = library_path(load_config())
+    try:
+        path.resolve().relative_to(library.resolve())
+    except ValueError:
+        return []
+    slug = page_slug(path, library)
+    return build_graph(library)["pages"].get(slug, {}).get("backlinks", [])
+
+
 def file_detail(path: Path) -> str:
     try:
         mtime = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
@@ -318,6 +716,80 @@ def scan(path: Path) -> list[Entry]:
     return folders + files
 
 
+def file_matches(folder: Path, needle: str) -> list[Entry]:
+    """Files and folders under this shelf whose names contain the text."""
+    needle = needle.lower()
+    if not needle:
+        return scan(folder)
+    found: list[Entry] = []
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dirnames[:] = [name for name in dirnames if not name.startswith(".") and name not in SKIP_DIRS]
+        base = Path(dirpath)
+        for name in dirnames:
+            if needle not in name.lower():
+                continue
+            path = base / name
+            found.append(Entry(path.relative_to(folder).as_posix(), folder_detail(path), "folder", path))
+        for name in filenames:
+            path = base / name
+            if name.startswith(".") or needle not in name.lower() or not is_text_file(path):
+                continue
+            found.append(Entry(path.relative_to(folder).as_posix(), file_detail(path), "file", path))
+    found.sort(key=lambda entry: entry.name.lower())
+    return found
+
+
+def shelf_stamp(path: Path) -> tuple[str, ...]:
+    try:
+        children = list(path.iterdir())
+    except OSError:
+        return ()
+    names = [child.name for child in children if not child.name.startswith(".") and child.name not in SKIP_DIRS]
+    return tuple(sorted(names))
+
+
+def strip_suffix(text: str, suffixes: tuple[str, ...] = MD_SUFFIXES) -> str:
+    lowered = text.lower()
+    for suffix in suffixes:
+        if lowered.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def clean_name(raw: str, *, page: bool) -> str:
+    text = raw.strip()
+    if page:
+        slug = re.sub(r"[^a-z0-9]+", "-", strip_suffix(text).lower()).strip("-")
+        if not slug:
+            raise ValueError("name needs a letter or number")
+        return slug + ".md"
+    if not text or text in {".", ".."} or text.startswith(".") or "/" in text or "\\" in text:
+        raise ValueError("folder name refused")
+    if len(Path(text).parts) != 1:
+        raise ValueError("folder name refused")
+    return text
+
+
+def new_child(folder: Path, name: str) -> Path:
+    path = folder / name
+    if path.exists():
+        raise FileExistsError(name)
+    return path
+
+
+def create_page(folder: Path, raw: str) -> Path:
+    path = new_child(folder, clean_name(raw, page=True))
+    title = strip_suffix(raw.strip()) or path.stem
+    path.write_text(f"# {title}\n", encoding="utf-8")
+    return path
+
+
+def create_folder(folder: Path, raw: str) -> Path:
+    path = new_child(folder, clean_name(raw, page=False))
+    path.mkdir()
+    return path
+
+
 def is_fence(line: str) -> bool:
     return line.lstrip().startswith("```") or line.lstrip().startswith("~~~")
 
@@ -352,6 +824,14 @@ def parse_inline(text: str) -> list[tuple[str, str]]:
                 out.append((text[i + 2:j], BOLD))
                 i = j + 2
                 continue
+        if text.startswith("[[", i):
+            end = text.find("]]", i + 2)
+            if end != -1:
+                inner = text[i + 2:end]
+                shown = inner.split("|", 1)[-1].split("#", 1)[0].strip() or inner
+                out.append((shown, LINK))
+                i = end + 2
+                continue
         if text[i] in "_*":
             marker = text[i]
             j = text.find(marker, i + 1)
@@ -366,7 +846,7 @@ def parse_inline(text: str) -> list[tuple[str, str]]:
                 i = j + 1
                 continue
         nxt = i + 1
-        while nxt < n and text[nxt] not in "_*`":
+        while nxt < n and text[nxt] not in "_*`[":
             nxt += 1
         out.append((text[i:nxt], TEXT))
         i = nxt
@@ -477,6 +957,172 @@ def focus_anchor(index: int, count: int, height: int, stride: int = 1) -> int:
     return max(0, min(index * stride, pulled))
 
 
+def wrap_ranges(text: str, width: int) -> list[tuple[int, int]]:
+    """Source spans that cover text. A break prefers the last space in the window."""
+    if width < 1:
+        return [(0, 0)]
+    if not text:
+        return [(0, 0)]
+    ranges: list[tuple[int, int]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        end = min(i + width, n)
+        if end < n:
+            cut = text.rfind(" ", i, end)
+            if cut > i:
+                end = cut + 1
+        ranges.append((i, end))
+        i = end
+    return ranges
+
+
+def slice_spans(spans: list[tuple[str, str]], start: int, end: int) -> list[tuple[str, str]]:
+    if start >= end:
+        return []
+    out: list[tuple[str, str]] = []
+    pos = 0
+    for text, style in spans:
+        nxt = pos + len(text)
+        if nxt <= start:
+            pos = nxt
+            continue
+        if pos >= end:
+            break
+        chunk = text[max(0, start - pos): min(len(text), end - pos)]
+        if chunk:
+            out.append((chunk, style))
+        pos = nxt
+    return out
+
+
+def wrap_spans(spans: list[tuple[str, str]], width: int) -> list[list[tuple[str, str]]]:
+    text = "".join(part for part, _ in spans)
+    rows: list[list[tuple[str, str]]] = []
+    for start, end in wrap_ranges(text, width):
+        piece = slice_spans(spans, start, end)
+        if piece and piece[-1][0].endswith(" "):
+            last, style = piece[-1]
+            last = last[:-1]
+            if last:
+                piece[-1] = (last, style)
+            else:
+                piece.pop()
+        rows.append(piece)
+    return rows or [[]]
+
+
+def focus_piece(raw: str, start: int, end: int, col: int) -> list[tuple[str, str]]:
+    piece = raw[start:end]
+    owns = start <= col < end or (col >= len(raw) and end == len(raw))
+    if owns:
+        return focus_spans(piece, min(max(0, col - start), len(piece)))
+    if piece.endswith(" "):
+        piece = piece[:-1]
+    return [(piece, FOCUS)] if piece else []
+
+
+IMAGE_LINE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_PREVIEW_CACHE: dict[tuple, list[str]] = {}
+
+
+def image_mark(raw: str) -> tuple[str, str] | None:
+    match = IMAGE_LINE.match(raw.strip())
+    if not match:
+        return None
+    return match.group(1).strip(), match.group(2).strip()
+
+
+def image_file(note: Path, dest: str) -> Path | None:
+    """Local image beside the note. None means a remote address, not a file."""
+    dest = dest.strip()
+    if not dest or dest.startswith(REMOTE):
+        return None
+    rel = Path(dest)
+    if rel.is_absolute():
+        return rel.expanduser().resolve()
+    if ".." in rel.parts:
+        raise ValueError(dest)
+    path = (note.parent / rel).resolve()
+    path.relative_to(note.parent.resolve())
+    return path
+
+
+def image_caption(alt: str, dest: str, *, missing: bool = False) -> str:
+    label = f"{alt}  {dest}" if alt else dest
+    return label + ("  (missing)" if missing else "")
+
+
+def image_tools(which=shutil.which) -> dict[str, str | None]:
+    return {
+        "preview": which("chafa"),
+        "open": which("imv") or which("xdg-open"),
+    }
+
+
+def image_status(tools: dict[str, str | None] | None = None) -> str:
+    found = tools or image_tools()
+    preview = "chafa" if found["preview"] else "not installed (chafa)"
+    opener = Path(found["open"]).name if found["open"] else "not installed (imv or xdg-open)"
+    return f"preview  {preview}\nopen     {opener}"
+
+
+def chafa_preview(path: Path, width: int, rows: int = 8) -> list[str]:
+    if width < 8 or not path.is_file() or path.suffix.lower() not in IMAGE_EXT:
+        return []
+    tool = shutil.which("chafa")
+    if not tool:
+        return []
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return []
+    key = (str(path), stamp, width, rows)
+    cached = _PREVIEW_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run(
+            [tool, "--format", "symbols", "-c", "none", f"--size={width}x{rows}", "--animate", "off", str(path)],
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    lines = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        clean = _ANSI.sub("", line).rstrip()
+        if clean:
+            lines.append(clean[:width])
+    _PREVIEW_CACHE[key] = lines
+    return lines
+
+
+def open_image(note: Path, raw: str, tools: dict[str, str | None] | None = None, spawn=None) -> str:
+    mark = image_mark(raw)
+    if mark is None:
+        return ""
+    _alt, dest = mark
+    try:
+        target = image_file(note, dest)
+    except ValueError:
+        return "image path refused"
+    if target is None:
+        return "not a local image"
+    if not target.is_file():
+        return "image missing"
+    found = tools or image_tools()
+    opener = found.get("open")
+    if not opener:
+        return "install imv to view images"
+    launch = spawn or subprocess.Popen
+    launch([opener, str(target)], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return f"opened {target.name}"
+
+
 def doc_layout(
     lines: list[str],
     row: int,
@@ -488,34 +1134,66 @@ def doc_layout(
     fences: list[bool] | None = None,
     margin: int = 2,
     renderer=None,
+    note: Path | None = None,
+    preview=None,
 ) -> list[tuple[int, int, list[tuple[str, str]]]]:
-    """Screen rows. The cursor line starts at the top, then stays centered."""
+    """Screen rows. Wrapped lines take more than one row. The cursor row starts at the top, then stays centered."""
     if height < 1 or not lines:
         return []
     row = max(0, min(row, len(lines) - 1))
     flags = fences if fences is not None else fence_flags(lines)
-    focus_y = focus_anchor(row, len(lines), height)
     inner = max(1, width - margin)
+    visuals: list[list[tuple[str, str]]] = []
+    cursor_at = 0
+    for index, raw in enumerate(lines):
+        if index == row:
+            pieces = wrap_ranges(raw, inner)
+            cursor_at = len(visuals)
+            for start, end in pieces:
+                if start <= col < end or (col >= len(raw) and end == len(raw)):
+                    cursor_at = len(visuals)
+                visuals.append(focus_piece(raw, start, end, col))
+            continue
+        mark = image_mark(raw) if markdown and not (flags[index] if index < len(flags) else False) else None
+        if mark is not None:
+            alt, dest = mark
+            missing = False
+            rows: list[str] = []
+            if note is not None:
+                try:
+                    target = image_file(note, dest)
+                except ValueError:
+                    target = None
+                    missing = True
+                if target is None:
+                    missing = not dest.startswith(REMOTE)
+                elif not target.is_file():
+                    missing = True
+                else:
+                    paint = preview if preview is not None else chafa_preview
+                    rows = paint(target, inner) or []
+            for line in rows:
+                visuals.append([(line, DIM)])
+            visuals.append([(image_caption(alt, dest, missing=missing), DIM)])
+            continue
+        rendered = render_unfocused(
+            raw,
+            markdown=markdown,
+            in_fence=flags[index] if index < len(flags) else False,
+            renderer=renderer,
+        )
+        visuals.extend(wrap_spans(rendered, inner))
+    if not visuals:
+        return []
+    cursor_at = max(0, min(cursor_at, len(visuals) - 1))
+    focus_y = focus_anchor(cursor_at, len(visuals), height)
+    first = cursor_at - focus_y
     painted: list[tuple[int, int, list[tuple[str, str]]]] = []
     for screen_y in range(height):
-        line_i = row - focus_y + screen_y
-        if line_i < 0 or line_i >= len(lines):
+        visual = first + screen_y
+        if visual < 0 or visual >= len(visuals) or not visuals[visual]:
             continue
-        if line_i == row:
-            visible, cursor = slice_focus(lines[line_i], col, inner)
-            spans = focus_spans(visible, cursor)
-        else:
-            spans = fit(
-                render_unfocused(
-                    lines[line_i],
-                    markdown=markdown,
-                    in_fence=flags[line_i] if line_i < len(flags) else False,
-                    renderer=renderer,
-                ),
-                inner,
-            )
-        if spans:
-            painted.append((screen_y, margin, spans))
+        painted.append((screen_y, margin, visuals[visual]))
     return painted
 
 
@@ -559,61 +1237,72 @@ def find_line(lines: list[str], query: str, start: int, direction: int = 1) -> i
     return None
 
 
-def help_lines(name: str) -> tuple[str, ...]:
+def help_lines(name: str, keys: KeyMap | None = None) -> tuple[str, ...]:
+    bound = keys or load_keys()
     return (
         name,
         "the book that will not stay shut",
         "",
         "List",
-        "  up down j k     move",
-        "  enter right     open",
-        "  left esc        back, or quit at the top",
-        "  q               quit",
-        "  ?               this help",
+        f"  {bound.show('list', 'up')}  {bound.show('list', 'down')}   move",
+        f"  {bound.show('list', 'open')}   open",
+        f"  {bound.show('list', 'new_page')}   new page    {bound.show('list', 'new_folder')}   new folder",
+        f"  {bound.show('list', 'back')}   back, or quit at the top",
+        f"  {bound.show('list', 'quit')}   quit",
+        f"  {bound.show('list', 'find')}   find a file",
+        f"  {bound.show('list', 'help')}   this help",
         "",
         "Reader, normal",
-        "  h j k l         move, like vim",
-        "  ctrl+i  i       insert at the cursor",
-        "  ctrl+a  a       append, then type",
-        "  esc  q          back, asks if unsaved",
+        f"  {bound.show('normal', 'left')} {bound.show('normal', 'down')} {bound.show('normal', 'up')} {bound.show('normal', 'right')}   move",
+        f"  {bound.show('normal', 'insert')}   insert at the cursor",
+        f"  {bound.show('normal', 'view')}   view the image on this line",
+        f"  {bound.show('normal', 'append')}   append, then type",
+        f"  {bound.show('normal', 'leave')} {bound.show('normal', 'quit')}   back, asks if unsaved",
         "",
         "Reader, insert",
         "  type            edit the raw line",
-        "  enter           new line",
-        "  backspace       delete",
-        "  esc             back to normal, not out",
+        f"  {bound.show('insert', 'break')}   new line",
+        f"  {bound.show('insert', 'backspace')}   delete",
+        f"  {bound.show('insert', 'normal')}   back to normal, not out",
         "",
         "Either mode",
-        "  arrows          move",
-        "  home end        ends of the line",
-        "  pgup pgdn       a page",
-        "  F2              save",
-        "  ctrl+z          undo    ctrl+y redo",
-        "  ctrl+f  /       find, then ctrl+n and ctrl+p",
-        "  F5              reload from disk",
-        "  ctrl+c          quit",
-        "  F1              help",
+        f"  {bound.show('normal', 'save')}   save",
+        f"  {bound.show('normal', 'undo')}   undo    {bound.show('normal', 'redo')} redo",
+        f"  {bound.show('normal', 'find')}   find text, then {bound.show('normal', 'find_next')} and {bound.show('normal', 'find_prev')}",
+        f"  {bound.show('normal', 'reload')}   reload from disk",
+        "  ctrl+c          quit, always",
+        f"  {bound.show('normal', 'help')}   help",
         "",
+        "Keys live in ~/.grimoire/keys.json. grimoire keys writes the file.",
         "The line you are on is the source.",
         "Other lines of a .md file hide #  **  and _ markers.",
-        "Other scripts stay plain text.",
         "",
-        "grimoire setup    where a bare launch opens",
-        "plugins           ~/.grimoire/plugins",
+        "grimoire            the pages in ~/.grimoire/pages",
+        "grimoire -c         the folder you are in",
+        "plugins            ~/.grimoire/plugins",
         "",
-        "esc closes help",
+        "Settings",
+        f"  library  {load_config().get('library', '')}",
+        f"  keys     {keys_path()}",
+        f"  theme    {theme_path()}",
+        *[f"  {line}" for line in image_status().splitlines()],
+        "  edit the file, then restart",
+        "",
+        "esc closes this menu",
     )
 
 
 class App:
     def __init__(self, root: Path, open_file: Path | None = None, name: str = "GRIMOIRE") -> None:
         self.name = name
+        self.keys = load_keys()
         self.root = root.resolve()
         self.cwd = self.root
         self.entries: list[Entry] = []
         self.selected = 0
         self.mode = "list"
         self.help_from = "list"
+        self.help_at = 0
         self.lines = [""]
         self.path: Path | None = None
         self.markdown = False
@@ -628,18 +1317,52 @@ class App:
         self.inserting = False
         self.plugins: PluginHost | None = None
         self.renderer = None
+        self.backlinks: list[str] = []
         self.undo: list[tuple[list[str], int, int]] = []
         self.redo: list[tuple[list[str], int, int]] = []
         self._coalesce: str | None = None
+        self.naming = "page"
+        self.shelf_stamp: tuple[str, ...] = ()
         if open_file is not None:
             self.open_path(open_file)
         else:
             self.refresh()
 
-    def refresh(self) -> None:
+    def listing(self) -> list[Entry]:
+        if self.mode == "filter" and self.query:
+            return file_matches(self.cwd, self.query)
+        return self.entries
+
+    def take_query(self, key: int | str, mode: str) -> bool:
+        if self.keys.pressed(mode, "erase", key):
+            self.query = self.query[:-1]
+            return True
+        if isinstance(key, int) and 32 <= key < 127:
+            self.query += chr(key)
+            return True
+        return False
+
+    def refresh(self, keep: Path | None = None) -> None:
+        if keep is None and self.entries and 0 <= self.selected < len(self.entries):
+            keep = self.entries[self.selected].path
         self.entries = scan(self.cwd)
-        if self.selected >= len(self.entries):
-            self.selected = max(0, len(self.entries) - 1)
+        self.shelf_stamp = shelf_stamp(self.cwd)
+        self.selected = 0
+        if keep is None:
+            return
+        for index, entry in enumerate(self.entries):
+            if entry.path == keep:
+                self.selected = index
+                return
+
+    def poll_shelf(self) -> bool:
+        if self.mode != "list":
+            return False
+        stamp = shelf_stamp(self.cwd)
+        if stamp == self.shelf_stamp:
+            return False
+        self.refresh()
+        return True
 
     def open_path(self, path: Path) -> None:
         self.lines, self.note = read_lines(path)
@@ -657,6 +1380,7 @@ class App:
         self.redo.clear()
         self._coalesce = None
         self.message = self.note
+        self.backlinks = backlinks_for(path)
         if self.plugins:
             self.plugins.emit("open", self)
 
@@ -779,6 +1503,8 @@ class App:
             return False
         self.dirty = False
         self.message = "saved"
+        refresh_graph_for(self.path)
+        self.backlinks = backlinks_for(self.path)
         if self.plugins:
             self.plugins.emit("save", self)
         return True
@@ -801,7 +1527,7 @@ class App:
         self.mode = "list"
         self.dirty = False
         self.message = ""
-        self.refresh()
+        self.refresh(keep=self.path)
         return True
 
     def jump_match(self, direction: int) -> None:
@@ -830,10 +1556,13 @@ class App:
         return True
 
     def open_selected(self) -> None:
-        if not self.entries:
+        shown = self.listing()
+        if not shown:
             return
-        entry = self.entries[self.selected]
+        entry = shown[min(self.selected, len(shown) - 1)]
+        self.query = ""
         if entry.kind == "folder":
+            self.mode = "list"
             self.cwd = entry.path
             self.selected = 0
             self.refresh()
@@ -850,37 +1579,55 @@ class App:
         return self.name + " › " + str(rel)
 
     def handle(self, key: int | str) -> bool:
-        """Return False to quit."""
+        """Return False to quit. ctrl+c always quits, even if keys.json omits it."""
         if key == curses.KEY_RESIZE:
             return True
         if key == 3:
             return False
         if self.mode == "help":
-            if key in (27, ord("q"), ord("?"), curses.KEY_F1):
+            if self.keys.pressed("help", "close", key):
                 self.mode = self.help_from
+            elif self.keys.pressed("help", "up", key):
+                self.help_at = max(0, self.help_at - 1)
+            elif self.keys.pressed("help", "down", key):
+                self.help_at += 1
             return True
         if self.mode == "search":
             return self.handle_search(key)
         if self.mode == "confirm":
             return self.handle_confirm(key)
+        if self.mode == "name":
+            return self.handle_name(key)
+        if self.mode == "filter":
+            return self.handle_filter(key)
         if self.mode == "list":
             return self.handle_list(key)
         return self.handle_read(key)
 
     def handle_list(self, key: int | str) -> bool:
-        if key in (ord("q"),):
+        if self.keys.pressed("list", "quit", key):
             return False
-        if key in (27, curses.KEY_LEFT, ord("h")):
+        if self.keys.pressed("list", "back", key):
             return self.go_up()
-        if key in (curses.KEY_UP, ord("k")):
+        if self.keys.pressed("list", "up", key):
             self.selected = max(0, self.selected - 1)
-        elif key in (curses.KEY_DOWN, ord("j")):
+        elif self.keys.pressed("list", "down", key):
             self.selected = min(max(0, len(self.entries) - 1), self.selected + 1)
-        elif key in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT, ord("l")):
+        elif self.keys.pressed("list", "open", key):
             self.open_selected()
-        elif key in (ord("?"), curses.KEY_F1):
+        elif self.keys.pressed("list", "help", key):
             self.help_from = "list"
+            self.help_at = 0
             self.mode = "help"
+        elif self.keys.pressed("list", "new_page", key):
+            self.begin_name("page")
+        elif self.keys.pressed("list", "new_folder", key):
+            self.begin_name("folder")
+        elif self.keys.pressed("list", "find", key):
+            self.query = ""
+            self.selected = 0
+            self.message = ""
+            self.mode = "filter"
         elif self.plugins:
             hit = self.plugins.dispatch(self, "list", key)
             if hit is not None:
@@ -897,103 +1644,127 @@ class App:
 
     def handle_read(self, key: int | str) -> bool:
         page = 20
-        if key in (curses.KEY_F2, 19):
+        mode = "insert" if self.inserting else "normal"
+        if self.keys.pressed(mode, "save", key):
             self.save()
             return True
-        if key == curses.KEY_F5:
+        if self.keys.pressed(mode, "reload", key):
             self.reload()
             return True
-        if key in (curses.KEY_F1,):
+        if self.keys.pressed(mode, "help", key):
             self.help_from = "read"
+            self.help_at = 0
             self.mode = "help"
             return True
-        if key in (6, ord("/")) and not self.inserting:
-            self.query = ""
-            self.mode = "search"
-            return True
-        if key == 14 and self.query:
-            self.jump_match(1)
-            return True
-        if key == 16 and self.query:
-            self.jump_match(-1)
-            return True
-        if key == 26:
+        if self.keys.pressed(mode, "undo", key):
             self.undo_edit()
             return True
-        if key == 25:
+        if self.keys.pressed(mode, "redo", key):
             self.redo_edit()
             return True
-        if key == curses.KEY_UP or (key == ord("k") and not self.inserting):
+        if self.keys.pressed(mode, "up", key):
             self.move_row(-1)
-        elif key == curses.KEY_DOWN or (key == ord("j") and not self.inserting):
+            return True
+        if self.keys.pressed(mode, "down", key):
             self.move_row(1)
-        elif key == curses.KEY_LEFT or (key == ord("h") and not self.inserting):
+            return True
+        if self.keys.pressed(mode, "left", key):
             self.move_col(-1)
-        elif key == curses.KEY_RIGHT or (key == ord("l") and not self.inserting):
+            return True
+        if self.keys.pressed(mode, "right", key):
             self.move_col(1)
-        elif key == curses.KEY_HOME or (key == ord("0") and not self.inserting):
+            return True
+        if self.keys.pressed(mode, "line_start", key):
             self.col = 0
             self.pref_col = 0
             self._coalesce = None
-        elif key == curses.KEY_END or (key == ord("$") and not self.inserting):
+            return True
+        if self.keys.pressed(mode, "line_end", key):
             self.col = len(self.lines[self.row])
             self.pref_col = self.col
             self._coalesce = None
-        elif key == curses.KEY_PPAGE:
+            return True
+        if self.keys.pressed(mode, "page_up", key):
             self.move_row(-page)
-        elif key == curses.KEY_NPAGE:
+            return True
+        if self.keys.pressed(mode, "page_down", key):
             self.move_row(page)
-        elif not self.inserting:
+            return True
+        if not self.inserting:
             return self.handle_normal(key)
-        elif key == 27:
+        if self.keys.pressed("insert", "normal", key):
             self.inserting = False
             self._coalesce = None
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            return True
+        if self.keys.pressed("insert", "backspace", key):
             self.erase_back()
-        elif key == curses.KEY_DC:
+            return True
+        if self.keys.pressed("insert", "delete", key):
             self.erase_forward()
-        elif key in (10, 13, curses.KEY_ENTER):
+            return True
+        if self.keys.pressed("insert", "break", key):
             self.break_line()
-        elif key == 9:
+            return True
+        if self.keys.pressed("insert", "indent", key):
             self.insert_text("  ")
-        elif self.plugins:
+            return True
+        if self.plugins:
             hit = self.plugins.dispatch(self, "insert", key)
             if hit is not None:
                 return hit
-        elif isinstance(key, int) and 32 <= key < 127:
+        if isinstance(key, int) and 32 <= key < 127:
             self.insert_text(chr(key))
         return True
 
     def handle_normal(self, key: int | str) -> bool:
-        if key == 27 or key == ord("q"):
+        leaving = self.keys.pressed("normal", "leave", key)
+        quitting = self.keys.pressed("normal", "quit", key)
+        if leaving or quitting:
             if self.dirty:
                 self.mode = "confirm"
                 self.message = "leave"
                 return True
-            return self.leave_reader() if key == 27 else False
-        # ctrl+i is tab on a normal terminal. ctrl+a is its own key.
-        if key in (9, ord("i")):
+            return self.leave_reader() if leaving else False
+        if self.keys.pressed("normal", "find", key):
+            self.query = ""
+            self.mode = "search"
+            return True
+        if self.keys.pressed("normal", "find_next", key) and self.query:
+            self.jump_match(1)
+            return True
+        if self.keys.pressed("normal", "find_prev", key) and self.query:
+            self.jump_match(-1)
+            return True
+        if self.keys.pressed("normal", "insert", key):
             self.begin_insert(append=False)
             return True
-        if key in (1, ord("a"), ord("A")):
+        if self.keys.pressed("normal", "append", key):
             self.begin_insert(append=True)
             return True
-        if key == ord("G"):
+        if self.keys.pressed("normal", "view", key):
+            if self.path is not None:
+                note = open_image(self.path, self.lines[self.row])
+                if note:
+                    self.message = note
+            return True
+        if self.keys.pressed("normal", "bottom", key):
             self.row = len(self.lines) - 1
             self.col = 0
             self.pref_col = 0
-        elif key == ord("g"):
+            return True
+        if self.keys.pressed("normal", "top", key):
             self.row = 0
             self.col = 0
             self.pref_col = 0
-        elif self.plugins:
+            return True
+        if self.plugins:
             hit = self.plugins.dispatch(self, "normal", key)
             if hit is not None:
                 return hit
         return True
 
     def handle_confirm(self, key: int | str) -> bool:
-        if key in (ord("s"), ord("y"), ord("S"), ord("Y")):
+        if self.keys.pressed("confirm", "yes", key):
             if self.message == "reload":
                 row = self.row
                 self.open_path(self.path) if self.path else None
@@ -1005,44 +1776,94 @@ class App:
                 return self.leave_reader()
             self.mode = "read"
             return True
-        if key in (ord("d"), ord("n"), ord("D"), ord("N")):
+        if self.keys.pressed("confirm", "no", key):
             if self.message == "reload":
                 self.mode = "read"
                 self.message = ""
                 return True
             return self.leave_reader()
-        if key == 27:
+        if self.keys.pressed("confirm", "stay", key):
             self.mode = "read"
             self.message = ""
-            return True
         return True
 
     def handle_search(self, key: int | str) -> bool:
-        if key in (27,):
+        if self.keys.pressed("search", "cancel", key):
             self.mode = "read"
             return True
-        if key in (curses.KEY_ENTER, 10, 13):
+        if self.keys.pressed("search", "jump", key):
             self.mode = "read"
             if self.query:
                 self.jump_match(1)
             return True
-        if key in (curses.KEY_BACKSPACE, 127, 8):
-            self.query = self.query[:-1]
+        if self.keys.pressed("search", "erase", key) or (isinstance(key, int) and 32 <= key < 127):
+            self.take_query(key, "search")
             return True
-        if isinstance(key, int) and 32 <= key < 127:
-            self.query += chr(key)
+        return True
+
+    def begin_name(self, kind: str) -> None:
+        self.naming = kind
+        self.query = ""
+        self.message = ""
+        self.mode = "name"
+
+    def finish_name(self) -> None:
+        kind = self.naming
+        raw = self.query
+        self.mode = "list"
+        self.query = ""
+        try:
+            path = create_page(self.cwd, raw) if kind == "page" else create_folder(self.cwd, raw)
+        except ValueError as exc:
+            self.message = str(exc)
+            return
+        except FileExistsError as exc:
+            self.message = f"already there: {exc}"
+            return
+        self.refresh(keep=path)
+        if kind == "page":
+            self.open_path(path)
+
+    def handle_name(self, key: int | str) -> bool:
+        if self.keys.pressed("name", "cancel", key):
+            self.mode = "list"
+            self.query = ""
+            return True
+        if self.keys.pressed("name", "accept", key):
+            self.finish_name()
+            return True
+        if self.take_query(key, "name"):
+            return True
+        return True
+
+    def handle_filter(self, key: int | str) -> bool:
+        if self.keys.pressed("filter", "cancel", key):
+            self.mode = "list"
+            self.query = ""
+            self.selected = 0
+            return True
+        if self.keys.pressed("filter", "open", key):
+            self.open_selected()
+            return True
+        shown = self.listing()
+        if self.keys.pressed("filter", "up", key):
+            self.selected = max(0, self.selected - 1)
+            return True
+        if self.keys.pressed("filter", "down", key):
+            self.selected = min(max(0, len(shown) - 1), self.selected + 1)
+            return True
+        if self.take_query(key, "filter"):
+            self.selected = 0
         return True
 
 
 def style_attr(style: str) -> int:
     italic = getattr(curses, "A_ITALIC", 0)
-    table = {
-        TITLE: curses.color_pair(1) | curses.A_BOLD,
-        HEADING: curses.color_pair(1) | curses.A_BOLD,
-        BOLD: curses.color_pair(1) | curses.A_BOLD,
-        ITALIC: curses.color_pair(2) | italic,
-        CODE: curses.color_pair(3),
-        FOLDER: curses.color_pair(4),
+    extra = {
+        TITLE: curses.A_BOLD,
+        HEADING: curses.A_BOLD,
+        BOLD: curses.A_BOLD,
+        ITALIC: italic,
         SELECTED: curses.A_BOLD,
         DIM: curses.A_DIM,
         FOCUS: curses.A_BOLD,
@@ -1050,16 +1871,27 @@ def style_attr(style: str) -> int:
         FOOTER: curses.A_DIM,
         TEXT: curses.A_DIM,
     }
-    return table.get(style, curses.A_DIM)
+    return THEME_PAIRS.get(style, 0) | extra.get(style, 0)
 
 
 def init_colors() -> None:
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_BLUE, -1)
-    curses.init_pair(2, curses.COLOR_GREEN, -1)
-    curses.init_pair(3, curses.COLOR_CYAN, -1)
-    curses.init_pair(4, curses.COLOR_MAGENTA, -1)
+    theme = load_theme()
+    THEME_PAIRS.clear()
+    limit = curses.COLORS if curses.has_colors() else 0
+    for number, role in enumerate(DEFAULT_THEME, start=1):
+        try:
+            fg = color_index(theme[role])
+        except ValueError:
+            fg = None
+        if fg is None or fg < 0 or fg >= limit:
+            fg = -1
+        try:
+            curses.init_pair(number, fg, -1)
+        except curses.error:
+            curses.init_pair(number, -1, -1)
+        THEME_PAIRS[role] = curses.color_pair(number)
 
 
 def put(stdscr: curses.window, y: int, x: int, text: str, attr: int, cols: int, rows: int) -> None:
@@ -1086,13 +1918,152 @@ def paint_spans(
             cursor_x += len(text)
 
 
-def footer_line(left: str, right: str, width: int) -> str:
-    if width <= 0:
+def reader_status(lines: list[str], row: int, col: int) -> str:
+    text = "\n".join(lines)
+    chars = len(text)
+    words = len(text.split())
+    return f"{chars} ch  {words} w  {row + 1}:{col + 1}"
+
+
+def fit_hints(parts: list[str], width: int, more: str = "?") -> str:
+    """Join hints that fit. A narrow pane keeps the first ones and a way to the menu."""
+    if width < 1:
         return ""
-    if not right or len(left) + len(right) + 2 > width:
-        return left[:width]
+    full = " · ".join(part for part in parts if part)
+    if len(full) <= width:
+        return full
+    tail = f" · {more}" if more else ""
+    room = width - len(tail)
+    if room < 1:
+        return more[:width]
+    chosen: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        trial = " · ".join(chosen + [part])
+        if len(trial) <= room:
+            chosen.append(part)
+            continue
+        break
+    if not chosen:
+        return more[:width]
+    return " · ".join(chosen) + tail
+
+
+def help_window(lines: list[str], height: int, scroll: int) -> tuple[int, list[str]]:
+    if height < 1:
+        return 0, []
+    scroll = max(0, min(scroll, max(0, len(lines) - height)))
+    return scroll, lines[scroll:scroll + height]
+
+
+def spread_text(parts: list[str], width: int) -> str:
+    """First part on the left edge, last part on the right edge."""
+    parts = [part for part in parts if part]
+    if width < 1 or not parts:
+        return ""
+    if sum(len(part) for part in parts) + len(parts) - 1 >= width or len(parts) == 1:
+        text = " ".join(parts)
+        return text[:width]
+    gaps = len(parts) - 1
+    extra = width - sum(len(part) for part in parts)
+    base, rem = divmod(extra, gaps)
+    out = []
+    for index, part in enumerate(parts):
+        out.append(part)
+        if index < gaps:
+            out.append(" " * (base + (1 if index < rem else 0)))
+    return "".join(out)
+
+
+def footer_bar(parts: list[str], width: int, more: str = "?", right: str = "") -> str:
+    """Hints stay whole. The bar uses the full width. Counts sit on the right edge."""
+    if width < 1:
+        return ""
+    if right and len(right) >= width:
+        return right[:width]
+    room = width - len(right) - 2 if right else width
+    hints = fit_hints(parts, max(1, room), more=more)
+    hint_parts = [part for part in hints.split(" · ") if part]
+    if not right:
+        return spread_text(hint_parts, width)
+    left = " · ".join(hint_parts)
     gap = width - len(left) - len(right)
-    return left + (" " * gap) + right
+    return left + (" " * max(1, gap)) + right
+
+
+def key_hint(keys: KeyMap, mode: str, action: str, label: str) -> str:
+    return f"{keys.show(mode, action)} {label}".strip()
+
+
+def bar_spec(app: App) -> tuple[list[str], str, str]:
+    keys = app.keys
+    if app.mode == "name":
+        kind = "page" if app.naming == "page" else "folder"
+        return [f"new {kind}: {app.query}", "enter make", "esc cancel"], "", ""
+    if app.mode == "filter":
+        return [f"/{app.query}", "enter open", "esc cancel"], "", ""
+    if app.mode == "list":
+        parts = [
+            f"{keys.show('list', 'up')} {keys.show('list', 'down')} move",
+            key_hint(keys, "list", "open", "open"),
+            key_hint(keys, "list", "find", "file"),
+            key_hint(keys, "list", "new_page", "page"),
+            key_hint(keys, "list", "new_folder", "folder"),
+            key_hint(keys, "list", "back", "back"),
+            key_hint(keys, "list", "quit", "quit"),
+            key_hint(keys, "list", "help", "keys"),
+        ]
+        if app.message:
+            parts.insert(0, app.message)
+        return parts, keys.show("list", "help"), ""
+    right = ""
+    if app.path is not None or app.lines:
+        name = app.path.name if app.path else ""
+        stats = reader_status(app.lines, app.row, app.col)
+        right = f"{name}  {stats}" if name else stats
+    if app.mode == "confirm":
+        if app.message == "reload":
+            parts = [
+                key_hint(keys, "confirm", "yes", "reload"),
+                key_hint(keys, "confirm", "no", "stay"),
+                key_hint(keys, "confirm", "stay", "stay"),
+            ]
+        else:
+            parts = [
+                "unsaved",
+                key_hint(keys, "confirm", "yes", "save"),
+                key_hint(keys, "confirm", "no", "discard"),
+                key_hint(keys, "confirm", "stay", "stay"),
+            ]
+        return parts, "", right
+    if app.mode == "search":
+        return ["/" + app.query], keys.show("normal", "help"), right
+    if app.inserting:
+        return [
+            "insert",
+            key_hint(keys, "insert", "normal", "normal"),
+            key_hint(keys, "insert", "save", "save"),
+            key_hint(keys, "normal", "help", "keys"),
+        ], keys.show("normal", "help"), right
+    parts = [
+        "normal",
+        key_hint(keys, "normal", "insert", "insert"),
+        key_hint(keys, "normal", "append", "append"),
+        key_hint(keys, "normal", "leave", "back"),
+        key_hint(keys, "normal", "help", "keys"),
+    ]
+    if app.message:
+        parts.insert(0, app.message)
+    elif app.dirty:
+        parts.insert(0, "unsaved")
+    return parts, keys.show("normal", "help"), right
+
+
+def paint_bar(stdscr: curses.window, app: App, rows: int, cols: int) -> None:
+    parts, more, right = bar_spec(app)
+    text = footer_bar(parts, cols - 1, more=more, right=right)
+    put(stdscr, rows - 1, 0, text, style_attr(FOOTER), cols, rows)
 
 
 def draw(stdscr: curses.window, app: App) -> None:
@@ -1102,12 +2073,14 @@ def draw(stdscr: curses.window, app: App) -> None:
         put(stdscr, 0, 0, "terminal too small", style_attr(FOOTER), cols, rows)
         stdscr.refresh()
         return
-    if app.mode == "list":
+    if app.mode in ("list", "name", "filter"):
         draw_list(stdscr, app, rows, cols)
     else:
         draw_read(stdscr, app, rows, cols)
     if app.mode == "help":
-        draw_help(stdscr, rows, cols, help_lines(app.name))
+        app.help_at = draw_help(stdscr, rows, cols, help_lines(app.name, app.keys), app.help_at)
+    else:
+        paint_bar(stdscr, app, rows, cols)
     stdscr.refresh()
 
 
@@ -1168,41 +2141,54 @@ def title_parts(title: str) -> tuple[str, str]:
     return title, ""
 
 
+def home_top(rows: int, header: int, entries: int) -> int:
+    """Vertical start of the banner plus the menu, when the whole block fits."""
+    list_h = 0 if entries < 1 else entries * 3 - 1
+    block = header + list_h
+    usable = rows - 1
+    if block >= usable or block < 1:
+        return 0
+    return (usable - block) // 2
+
+
 def draw_list(stdscr: curses.window, app: App, rows: int, cols: int) -> None:
     name, suffix = title_parts(app.title())
     art = banner(name)
+    shown = app.listing()
     if art and len(art[0]) < cols - 2 and rows >= 16:
-        left = max(0, (cols - 1 - len(art[0])) // 2)
+        width = max(len(line) for line in art)
+        left = max(0, (cols - 1 - width) // 2)
+        top = home_top(rows, len(art) + 1, len(shown))
         for i, line in enumerate(art):
-            put(stdscr, i, left, line, style_attr(TITLE), cols, rows)
+            put(stdscr, top + i, left, line, style_attr(TITLE), cols, rows)
         if suffix:
             label = "› " + suffix
             put(
                 stdscr,
-                len(art),
+                top + len(art),
                 max(0, (cols - 1 - len(label)) // 2),
                 label,
                 style_attr(DIM),
                 cols,
                 rows,
             )
-        header = len(art) + 1
+        header = top + len(art) + 1
     else:
         title = app.title()
-        put(stdscr, 0, max(0, (cols - len(title)) // 2), title, style_attr(TITLE), cols, rows)
-        header = 2
+        top = home_top(rows, 2, len(shown))
+        put(stdscr, top, max(0, (cols - len(title)) // 2), title, style_attr(TITLE), cols, rows)
+        header = top + 2
     content_h = rows - 1 - header
-    painted = list_layout(app.entries, app.selected, content_h, cols)
+    painted = list_layout(shown, app.selected, content_h, cols)
     paint_spans(stdscr, painted, header, cols, rows)
-    if not app.entries:
-        empty = "empty"
-        put(stdscr, rows // 2, max(0, (cols - len(empty)) // 2), empty, style_attr(DIM), cols, rows)
-    left = "↑↓ move · enter open · ← back · q quit · ? help"
-    put(stdscr, rows - 1, 0, footer_line(left, "", cols - 1), style_attr(FOOTER), cols, rows)
+    if not shown:
+        empty = "no file" if app.mode == "filter" and app.query else "empty"
+        put(stdscr, min(rows - 2, header + 1), max(0, (cols - len(empty)) // 2), empty, style_attr(DIM), cols, rows)
 
 
 def draw_read(stdscr: curses.window, app: App, rows: int, cols: int) -> None:
-    content_h = rows - 1
+    link_row = 1 if app.backlinks else 0
+    content_h = rows - 1 - link_row
     painted = doc_layout(
         app.lines,
         app.row,
@@ -1212,75 +2198,97 @@ def draw_read(stdscr: curses.window, app: App, rows: int, cols: int) -> None:
         markdown=app.markdown,
         fences=app.fences,
         renderer=app.renderer,
+        note=app.path,
     )
     paint_spans(stdscr, painted, 0, cols, rows)
-    if app.mode == "confirm":
-        if app.message == "reload":
-            left = "reload discards edits   s reload   d stay   esc stay"
-        else:
-            left = "unsaved   s save   d discard   esc stay"
-    elif app.mode == "search":
-        left = "/" + app.query
-    elif app.inserting:
-        left = "insert · esc normal · F2 save"
-    else:
-        left = "normal · ctrl+i insert · ctrl+a append · esc back"
-        if app.message:
-            left = app.message + "  ·  " + left
-        elif app.dirty:
-            left = "unsaved  ·  " + left
-    name = app.path.name if app.path else ""
-    right = f"{name}  {app.row + 1}/{len(app.lines)}"
-    put(stdscr, rows - 1, 0, footer_line(left, right, cols - 1), style_attr(FOOTER), cols, rows)
+    if app.backlinks:
+        put(
+            stdscr,
+            rows - 2,
+            0,
+            ("← " + ", ".join(app.backlinks))[: cols - 1],
+            style_attr(DIM),
+            cols,
+            rows,
+        )
 
 
-def draw_help(stdscr: curses.window, rows: int, cols: int, lines: tuple[str, ...]) -> None:
+def draw_help(stdscr: curses.window, rows: int, cols: int, lines: tuple[str, ...], scroll: int = 0) -> int:
     stdscr.erase()
-    width = min(62, cols - 4)
-    height = min(len(lines) + 2, rows - 2)
+    width = max(20, min(62, cols - 2))
+    inner = max(8, width - 4)
+    wrapped: list[str] = []
+    for line in lines:
+        if not line:
+            wrapped.append("")
+            continue
+        for start, end in wrap_ranges(line, inner):
+            piece = line[start:end].rstrip()
+            if piece:
+                wrapped.append(piece)
+    height = min(max(6, len(wrapped) + 3), rows - 1)
     top = max(0, (rows - height) // 2)
     left = max(0, (cols - width) // 2)
+    body = height - 3
+    scroll, page = help_window(wrapped, body, scroll)
+    more = scroll + body < len(wrapped)
+    hint = "j k scroll · esc close" if more or scroll else "esc close"
     for y in range(height):
         put(stdscr, top + y, left, " " * (width - 1), curses.A_NORMAL, cols, rows)
     put(stdscr, top, left, "╭" + "─" * (width - 3) + "╮", style_attr(DIM), cols, rows)
     put(stdscr, top + height - 1, left, "╰" + "─" * (width - 3) + "╯", style_attr(DIM), cols, rows)
-    for i, line in enumerate(lines):
+    for i, line in enumerate(page):
         y = top + 1 + i
-        if y >= top + height - 1:
-            break
         put(stdscr, y, left, "│", style_attr(DIM), cols, rows)
         put(stdscr, y, left + width - 2, "│", style_attr(DIM), cols, rows)
-        put(stdscr, y, left + 2, line[: width - 4], style_attr(TEXT if i else TITLE), cols, rows)
+        style = TITLE if scroll == 0 and i == 0 else TEXT
+        put(stdscr, y, left + 2, line[:inner], style_attr(style), cols, rows)
+    hint_line = hint[:inner]
+    hint_pad = max(0, (inner - len(hint_line)) // 2)
+    put(stdscr, top + height - 2, left + 2, " " * hint_pad + hint_line, style_attr(DIM), cols, rows)
+    return scroll
 
 
 USAGE = """\
-grimoire                  open the folder you are in, or whatever setup saved
-grimoire .                this folder
-grimoire library          the shelf in config
+grimoire                  open ~/.grimoire/pages
+grimoire -c               the folder you are in
+grimoire --current        same as -c
+grimoire -l, --local      same as -c
 grimoire <path>           that file or folder
-grimoire setup            choose where a bare launch opens
+grimoire setup            choose the shelf and the name
+grimoire graph             write the page graph and print it
+grimoire graph --json      same graph, for an agent
+grimoire graph <page>      links and backlinks for one page
+grimoire keys             write ~/.grimoire/keys.json if missing, then print it
+grimoire lint             orphans and links that point nowhere
+grimoire pages [--json]    list pages, links, and backlinks
+grimoire read <page>       print one page
+grimoire write <page>      write a page from stdin, then refresh the graph
+grimoire search <query>    find a line in the pages
+grimoire mcp               stdio MCP server for agents
 grimoire plugins          list plugins in ~/.grimoire/plugins
+grimoire images           which image tools are installed
+grimoire theme            write ~/.grimoire/theme.json if missing, then print it
 
 Config: ~/.grimoire/config.json
   name      text on the title row (default GRIMOIRE)
-  open      cwd, library, or a path
-  library   shelf used by `grimoire library` (default ~/scripts)
+  library   shelf used by a bare launch (default ~/.grimoire/pages)
 """
 
 
+LOCAL_FLAGS = {"-c", "--current", "-l", "--local"}
+
+
 def resolve_launch(argv: list[str], cfg: dict[str, str], cwd: Path) -> tuple[Path, Path | None]:
-    if not argv:
-        mode = cfg["open"]
-        if mode == "cwd":
+    wants_local = any(arg in LOCAL_FLAGS for arg in argv)
+    args = [arg for arg in argv if arg not in LOCAL_FLAGS]
+    if not args:
+        if wants_local:
             return cwd.resolve(), None
-        if mode == "library":
-            return library_path(cfg), None
-        return _path_target(mode, cwd)
-    if argv[0] in ("library", "--library"):
         return library_path(cfg), None
-    if argv[0] == ".":
-        return cwd.resolve(), None
-    return _path_target(argv[0], cwd)
+    if args[0] in ("library", "--library", "."):
+        return (library_path(cfg), None) if args[0] != "." else (cwd.resolve(), None)
+    return _path_target(args[0], cwd)
 
 
 def _path_target(raw: str, cwd: Path) -> tuple[Path, Path | None]:
@@ -1356,16 +2364,258 @@ def setup_config(args: list[str]) -> dict[str, str]:
     return merged
 
 
+def show_graph(args: list[str]) -> None:
+    library = library_path(load_config())
+    path = write_graph(library)
+    graph = json.loads(path.read_text(encoding="utf-8"))
+    if "--json" in args:
+        print(path.read_text(encoding="utf-8"), end="")
+        return
+    page = next((arg for arg in args if not arg.startswith("-")), None)
+    if page:
+        found = None
+        for slug, info in graph["pages"].items():
+            if slug.lower() == page.lower():
+                found = (slug, info)
+                break
+        if found is None:
+            print(f"grimoire: no page {page}", file=sys.stderr)
+            raise SystemExit(1)
+        slug, info = found
+        print(slug)
+        print("  links      " + (", ".join(info["links"]) or "-"))
+        print("  backlinks  " + (", ".join(info["backlinks"]) or "-"))
+        if info["missing"]:
+            print("  missing    " + ", ".join(info["missing"]))
+        return
+    print(path)
+    if not graph["pages"]:
+        print("(no pages)")
+        return
+    for slug, info in sorted(graph["pages"].items()):
+        outs = ", ".join(info["links"]) or "-"
+        backs = ", ".join(info["backlinks"]) or "-"
+        print(f"{slug}  -> {outs}  <- {backs}")
+
+
+def show_lint() -> None:
+    library = library_path(load_config())
+    path = write_graph(library)
+    graph = json.loads(path.read_text(encoding="utf-8"))
+    missing: list[str] = []
+    orphans: list[str] = []
+    for slug, info in sorted(graph["pages"].items()):
+        for name in info["missing"]:
+            missing.append(f"{slug} -> {name}")
+        if slug not in ("index", "log") and not info["backlinks"]:
+            orphans.append(slug)
+    print(path)
+    if not missing and not orphans:
+        print("clean")
+        return
+    for line in missing:
+        print(f"missing  {line}")
+    for slug in orphans:
+        print(f"orphan   {slug}")
+
+
+def page_file(slug: str, library: Path) -> Path:
+    raw = strip_suffix(slug.strip())
+    rel = Path(raw)
+    if not raw or rel.is_absolute() or ".." in rel.parts or any(part.startswith(".") for part in rel.parts):
+        raise ValueError(f"bad page {slug}")
+    path = (library / rel).with_suffix(".md").resolve()
+    path.relative_to(library.resolve())
+    return path
+
+
+def catalog(cfg: dict[str, str] | None = None) -> list[dict]:
+    cfg = cfg or load_config()
+    graph = build_graph(library_path(cfg))
+    return [
+        {
+            "slug": slug,
+            "title": info["title"],
+            "path": info["path"],
+            "links": info["links"],
+            "backlinks": info["backlinks"],
+        }
+        for slug, info in sorted(graph["pages"].items())
+    ]
+
+
+def read_page(slug: str, cfg: dict[str, str] | None = None) -> str:
+    cfg = cfg or load_config()
+    path = page_file(slug, library_path(cfg))
+    if not path.is_file():
+        raise FileNotFoundError(slug)
+    return path.read_text(encoding="utf-8")
+
+
+def write_page(slug: str, text: str, cfg: dict[str, str] | None = None) -> dict[str, str]:
+    cfg = cfg or load_config()
+    library = library_path(cfg)
+    path = page_file(slug, library)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    path.write_text(text, encoding="utf-8")
+    write_graph(library)
+    return {"slug": page_slug(path, library), "path": str(path)}
+
+
+def search_pages(query: str, cfg: dict[str, str] | None = None, limit: int = 40) -> list[dict]:
+    cfg = cfg or load_config()
+    needle = query.lower().strip()
+    hits: list[dict] = []
+    if not needle:
+        return hits
+    library = library_path(cfg)
+    for path in sorted(list_pages(library).values()):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        slug = page_slug(path, library)
+        for number, line in enumerate(lines, 1):
+            if needle not in line.lower():
+                continue
+            hits.append({"slug": slug, "line": number, "text": line.strip()})
+            if len(hits) >= limit:
+                return hits
+    return hits
+
+
+def show_pages(args: list[str]) -> None:
+    data = catalog()
+    if "--json" in args:
+        print(json.dumps(data, indent=2))
+        return
+    if not data:
+        print("(no pages)")
+        return
+    for item in data:
+        print(f"{item['slug']}  {item['title']}")
+
+
+def show_read(args: list[str]) -> None:
+    if not args:
+        print("grimoire: read needs a page", file=sys.stderr)
+        raise SystemExit(1)
+    print(read_page(args[0]), end="")
+
+
+def show_write(args: list[str]) -> None:
+    if not args:
+        print("grimoire: write needs a page", file=sys.stderr)
+        raise SystemExit(1)
+    print(json.dumps(write_page(args[0], sys.stdin.read())))
+
+
+def show_search(args: list[str]) -> None:
+    query = " ".join(arg for arg in args if arg != "--json")
+    hits = search_pages(query)
+    if "--json" in args:
+        print(json.dumps(hits, indent=2))
+        return
+    if not hits:
+        print("(none)")
+        return
+    for hit in hits:
+        print(f"{hit['slug']}:{hit['line']}  {hit['text']}")
+
+
+MCP_TOOLS = [
+    {"name": "pages", "description": "List Grimoire pages with links and backlinks.", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "read", "description": "Read one page by slug. Does not open the reader.", "inputSchema": {"type": "object", "properties": {"slug": {"type": "string"}}, "required": ["slug"]}},
+    {"name": "write", "description": "Write a markdown page and refresh the graph.", "inputSchema": {"type": "object", "properties": {"slug": {"type": "string"}, "text": {"type": "string"}}, "required": ["slug", "text"]}},
+    {"name": "search", "description": "Search page text. Returns slug, line, and the line.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+    {"name": "graph", "description": "Rebuild and return the page graph.", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "lint", "description": "Report orphan pages and links that point nowhere.", "inputSchema": {"type": "object", "properties": {}}},
+]
+
+
+def mcp_result(name: str, arguments: dict) -> object:
+    if name == "pages":
+        return catalog()
+    if name == "read":
+        slug = str(arguments.get("slug", ""))
+        return {"slug": slug, "text": read_page(slug)}
+    if name == "write":
+        return write_page(str(arguments.get("slug", "")), str(arguments.get("text", "")))
+    if name == "search":
+        return search_pages(str(arguments.get("query", "")))
+    if name == "graph":
+        library = library_path(load_config())
+        path = write_graph(library)
+        return json.loads(path.read_text(encoding="utf-8"))
+    if name == "lint":
+        library = library_path(load_config())
+        graph = build_graph(library)
+        missing = [f"{slug} -> {name}" for slug, info in graph["pages"].items() for name in info["missing"]]
+        orphans = [slug for slug, info in graph["pages"].items() if slug not in ("index", "log") and not info["backlinks"]]
+        return {"missing": missing, "orphans": orphans}
+    raise ValueError(f"unknown tool {name}")
+
+
+def serve_mcp() -> None:
+    """Newline-delimited JSON-RPC. Logs stay on stderr so they do not break the stream."""
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "id" not in msg:
+            continue
+        method = msg.get("method")
+        mid = msg["id"]
+        if method == "initialize":
+            result = {
+                "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2024-11-05"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "grimoire", "version": "1.0.0"},
+            }
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = {"tools": MCP_TOOLS}
+        elif method == "tools/call":
+            params = msg.get("params") or {}
+            try:
+                payload = mcp_result(str(params.get("name")), params.get("arguments") or {})
+                result = {"content": [{"type": "text", "text": json.dumps(payload)}], "isError": False}
+            except Exception as exc:
+                result = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+        else:
+            reply = {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"unknown method {method}"}}
+            sys.stdout.write(json.dumps(reply) + "\n")
+            sys.stdout.flush()
+            continue
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+        sys.stdout.flush()
+
+
 def main(stdscr: curses.window, app: App) -> None:
     curses.curs_set(0)
     init_colors()
     stdscr.keypad(True)
+    pending = True
     try:
         while True:
-            draw(stdscr, app)
+            stdscr.timeout(400 if app.mode == "list" else -1)
+            if pending:
+                draw(stdscr, app)
+                pending = False
             key = stdscr.getch()
+            if key == -1:
+                pending = app.poll_shelf()
+                continue
             if not app.handle(key):
                 return
+            pending = True
     except KeyboardInterrupt:
         return
 
@@ -1383,6 +2633,46 @@ def run(argv: list[str] | None = None) -> None:
             print("\n".join(host.loaded))
         elif not host.errors:
             print("(none)")
+        return
+    if args and args[0] == "images":
+        print(image_status())
+        return
+    if args and args[0] == "theme":
+        path = theme_path()
+        if not path.is_file():
+            write_default_theme(path)
+        print(path)
+        print(path.read_text(encoding="utf-8"), end="")
+        print("colors: black red green yellow blue magenta cyan white default")
+        print("a number 0-255 also works, if the terminal has that many")
+        print("the background stays the terminal's")
+        return
+    if args and args[0] == "graph":
+        show_graph(args[1:])
+        return
+    if args and args[0] == "keys":
+        path = keys_path()
+        if not path.is_file():
+            write_default_keys(path)
+        print(path)
+        return
+    if args and args[0] == "lint":
+        show_lint()
+        return
+    if args and args[0] == "pages":
+        show_pages(args[1:])
+        return
+    if args and args[0] == "read":
+        show_read(args[1:])
+        return
+    if args and args[0] == "write":
+        show_write(args[1:])
+        return
+    if args and args[0] == "search":
+        show_search(args[1:])
+        return
+    if args and args[0] == "mcp":
+        serve_mcp()
         return
     if args and args[0] == "setup":
         setup_config(args[1:])

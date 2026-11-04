@@ -20,28 +20,57 @@ No install step copies config. Each person gets their own `~/.grimoire/config.js
 ## Use
 
 ```sh
-grimoire                  # folder you are in, unless setup says otherwise
-grimoire .                # this folder, always
-grimoire library          # the shelf in config, default ~/scripts
+grimoire                  # ~/.grimoire/pages
+grimoire -c               # the folder you are in
+grimoire --local          # same as -c
 grimoire path/to/file.md
-grimoire setup            # ask where a bare launch opens
+grimoire setup            # shelf path and the name on screen
 ```
 
 `folio` still runs the same program.
+
+Keys are `~/.grimoire/keys.json`. `grimoire keys` writes it if it is missing. Action names stay fixed. You change the key list. ctrl+c always quits.
+
+Agents do not open the reader. They use `grimoire pages`, `grimoire read`, `grimoire search`, and `grimoire write`. `grimoire mcp` is the same calls over stdio for an MCP client.
 
 Config is `~/.grimoire/config.json`:
 
 ```json
 {
   "name": "GRIMOIRE",
-  "open": "cwd",
-  "library": "~/scripts"
+  "open": "library",
+  "library": "~/.grimoire/pages"
 }
 ```
 
-`open` is `cwd`, `library`, or a path. esc leaves a file or a folder. q quits. ? is help.
+`open` is `cwd`, `library`, or a path. esc leaves a file or a folder. q quits. On the shelf, `n` makes a page and `N` makes a folder. `/` finds a file by name. Inside a page, `/` finds text. ? opens the keys and settings menu. The bottom bar shows only the hints that fit. A narrow pane keeps the first ones and `?`.
+
+Colors are `~/.grimoire/theme.json`. `grimoire theme` writes it if it is missing. Names are `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, and `default`. A number from 0 to 255 also works when the terminal has that color. The background is always the terminal's. The font is the terminal's too. Restart Grimoire after an edit.
 
 Plugins are plain Python files in `~/.grimoire/plugins`. Each one defines `register(api)`. Core keys win. A handler returns False to quit the app. `grimoire plugins` lists what loaded. Copy `examples/linecount.py` there to try one: ctrl+w reports the line count.
+
+## Images
+
+A line that is only `![alt](path.png)` shows the alt text and the path. The cursor line stays the raw markdown. Nothing is downloaded. A web address stays text.
+
+Two optional tools. Neither is required.
+
+```sh
+grimoire images
+```
+
+| tool | if it is installed | if it is not |
+| --- | --- | --- |
+| `chafa` | a small text preview in the reader | the alt text and the path |
+| `imv` | enter or o opens the file | `xdg-open` is the backup |
+| neither opener | | the footer says `install imv to view images` |
+
+```sh
+# Arch
+sudo pacman -S chafa imv
+```
+
+`chafa` is only used as symbols, so the preview is text and works in Ghostty, foot, Alacritty, Herdr, or ssh. It does not send Kitty or sixel sequences. The real picture is the viewer.
 
 ```python
 def register(api):
