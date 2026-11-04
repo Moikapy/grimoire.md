@@ -25,6 +25,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -802,7 +803,8 @@ def links_in(text: str) -> list[str]:
     found: list[str] = []
     for match in re.finditer(r"\[\[([^\]|#]+)", text):
         found.append(match.group(1).strip())
-    for match in re.finditer(r"(?<!!)\[[^\]]*\]\(([^)]+)\)", text):  # ![alt](x) is an image, not a page
+    text = re.sub(r"(?<!\\)!\[[^\]]*\]\([^)]*\)", "", text)  # images are not pages; [![b](b.png)](page.md) keeps its link
+    for match in re.finditer(r"\[[^\]]*\]\(([^)]+)\)", text):
         target = match.group(1).strip().split("#", 1)[0]
         if target.startswith(REMOTE):
             continue
@@ -2810,6 +2812,38 @@ def read_page(slug: str, cfg: dict[str, str] | None = None) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def atomic_write(path: Path, data: bytes) -> None:
+    """A crash mid-write leaves the old file, not half of the new one. Keeps the old file's mode."""
+    try:
+        mode = path.stat().st_mode & 0o7777
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    try:
+        folder = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(folder)
+    except OSError:
+        pass
+    finally:
+        os.close(folder)
+
+
 def write_page(slug: str, text: str, cfg: dict[str, str] | None = None) -> dict[str, str]:
     cfg = cfg or load_config()
     library = library_path(cfg)
@@ -2817,9 +2851,7 @@ def write_page(slug: str, text: str, cfg: dict[str, str] | None = None) -> dict[
     path.parent.mkdir(parents=True, exist_ok=True)
     if text and not text.endswith("\n"):
         text += "\n"
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)  # a crash mid-write leaves the old page, not half of the new one
+    atomic_write(path, text.encode("utf-8"))
     write_graph(library)
     return {"slug": page_slug(path, library), "path": str(path)}
 
@@ -2932,9 +2964,12 @@ def serve_mcp() -> None:
             continue
         method = msg.get("method")
         mid = msg["id"]
+        params = msg.get("params")
+        if not isinstance(params, dict):
+            params = {}
         if method == "initialize":
             result = {
-                "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2024-11-05"),
+                "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "grimoire", "version": "1.0.0"},
             }
@@ -2943,7 +2978,6 @@ def serve_mcp() -> None:
         elif method == "tools/list":
             result = {"tools": MCP_TOOLS}
         elif method == "tools/call":
-            params = msg.get("params") or {}
             try:
                 payload = mcp_result(str(params.get("name")), params.get("arguments") or {})
                 result = {"content": [{"type": "text", "text": json.dumps(payload)}], "isError": False}

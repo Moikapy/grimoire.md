@@ -208,6 +208,14 @@ class ParseTests(unittest.TestCase):
         text = "![shot](/home/x/pic.png)\n![rel](img/a.png)\nSee [home](welcome.md) and [[links]].\n"
         self.assertEqual(links_in(text), ["links", "welcome"])
 
+    def test_linked_image_keeps_outer_link(self):
+        from grimoire import links_in
+        self.assertEqual(links_in("[![badge](img/b.png)](setup.md)"), ["setup"])
+
+    def test_escaped_bang_is_still_a_link(self):
+        from grimoire import links_in
+        self.assertEqual(links_in("Note\\![see this](guide.md)"), ["guide"])
+
     def test_graph_backlinks(self):
         from grimoire import build_graph, write_graph
         with tempfile.TemporaryDirectory() as tmp:
@@ -613,9 +621,35 @@ class AgentTests(unittest.TestCase):
 
     def test_write_leaves_no_temp_file(self):
         grimoire.write_page("note", "hi", self.cfg)
+        grimoire.write_page("note", "again", self.cfg)
         names = sorted(p.name for p in self.library.iterdir())
-        self.assertNotIn(".note.md.tmp", names)
+        self.assertEqual([n for n in names if n.endswith(".tmp")], [])
         self.assertIn("note.md", names)
+
+    def test_write_keeps_page_mode(self):
+        page = self.library / "private.md"
+        page.write_text("x\n")
+        os.chmod(page, 0o600)
+        grimoire.write_page("private", "y", self.cfg)
+        self.assertEqual(page.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(page.read_text(), "y\n")
+
+    def test_new_page_follows_umask(self):
+        old = os.umask(0o022)
+        try:
+            grimoire.write_page("fresh", "x", self.cfg)
+        finally:
+            os.umask(old)
+        self.assertEqual((self.library / "fresh.md").stat().st_mode & 0o777, 0o644)
+
+    def test_failed_write_keeps_old_page_and_no_temp(self):
+        grimoire.write_page("note", "old", self.cfg)
+        from unittest import mock
+        with mock.patch.object(grimoire.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                grimoire.write_page("note", "new", self.cfg)
+        self.assertEqual((self.library / "note.md").read_text(), "old\n")
+        self.assertEqual([p.name for p in self.library.iterdir() if p.name.endswith(".tmp")], [])
 
     def test_mcp_survives_non_object_lines(self):
         import io
@@ -624,6 +658,8 @@ class AgentTests(unittest.TestCase):
             json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
             json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
             json.dumps({"jsonrpc": "2.0", "id": 3, "method": "nope"}),
+            json.dumps({"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": "x"}),
+            json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": [1]}),
         ]
         out = io.StringIO()
         old_in, old_out = sys.stdin, sys.stdout
@@ -633,10 +669,12 @@ class AgentTests(unittest.TestCase):
         finally:
             sys.stdin, sys.stdout = old_in, old_out
         replies = [json.loads(line) for line in out.getvalue().splitlines()]
-        self.assertEqual([r["id"] for r in replies], [1, 2, 3])
+        self.assertEqual([r["id"] for r in replies], [1, 2, 3, 4, 5])
         self.assertEqual(replies[0]["result"], {})
         self.assertEqual(len(replies[1]["result"]["tools"]), len(grimoire.MCP_TOOLS))
         self.assertEqual(replies[2]["error"]["code"], -32601)
+        self.assertEqual(replies[3]["result"]["protocolVersion"], "2024-11-05")
+        self.assertTrue(replies[4]["result"]["isError"])
 
 
 if __name__ == "__main__":
