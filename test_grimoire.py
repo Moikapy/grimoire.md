@@ -5,6 +5,7 @@ import curses
 import tempfile
 import unittest
 import os
+import sys
 import json
 from pathlib import Path
 
@@ -201,6 +202,19 @@ class ParseTests(unittest.TestCase):
     def test_wiki_link_hides_brackets(self):
         spans = render_unfocused("see [[welcome]] now", markdown=True, in_fence=False)
         self.assertEqual([t for t, _ in spans], ["see ", "welcome", " now"])
+
+    def test_image_is_not_a_page_link(self):
+        from grimoire import links_in
+        text = "![shot](/home/x/pic.png)\n![rel](img/a.png)\nSee [home](welcome.md) and [[links]].\n"
+        self.assertEqual(links_in(text), ["links", "welcome"])
+
+    def test_linked_image_keeps_outer_link(self):
+        from grimoire import links_in
+        self.assertEqual(links_in("[![badge](img/b.png)](setup.md)"), ["setup"])
+
+    def test_escaped_bang_is_still_a_link(self):
+        from grimoire import links_in
+        self.assertEqual(links_in("Note\\![see this](guide.md)"), ["guide"])
 
     def test_graph_backlinks(self):
         from grimoire import build_graph, write_graph
@@ -423,6 +437,17 @@ class ParseTests(unittest.TestCase):
             self.assertEqual(saved["name"], "GRIMOIRE")
             self.assertTrue(path.is_file())
 
+    def test_ctrl_q_quits_and_q_does_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["GRIMOIRE_KEYS"] = str(Path(tmp) / "none.json")
+            try:
+                app = App(Path(tmp))
+                self.assertEqual(grimoire.parse_key("ctrl+q"), 17)
+                self.assertTrue(app.handle(ord("q")))
+                self.assertFalse(app.handle(17))
+            finally:
+                os.environ.pop("GRIMOIRE_KEYS", None)
+
     def test_keys_file_rebinds_quit(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "keys.json"
@@ -431,7 +456,7 @@ class ParseTests(unittest.TestCase):
             try:
                 app = App(Path(tmp))
                 self.assertNotEqual(grimoire.parse_key("G"), grimoire.parse_key("g"))
-                self.assertTrue(app.handle(ord("q")))
+                self.assertTrue(app.handle(17))  # ctrl+q no longer quits once keys.json rebinds it
                 self.assertEqual(app.mode, "list")
                 self.assertFalse(app.handle(ord("x")))
             finally:
@@ -777,6 +802,102 @@ class GraphTests(unittest.TestCase):
 
 def math_dist(a, b):
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
+class AgentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.library = Path(self.tmp.name)
+        self.cfg = {"library": str(self.library)}
+
+    def test_dotted_slugs_do_not_collide(self):
+        grimoire.write_page("v1", "one", self.cfg)
+        grimoire.write_page("v1.2", "two", self.cfg)
+        self.assertEqual(grimoire.read_page("v1", self.cfg), "one\n")
+        self.assertEqual(grimoire.read_page("v1.2", self.cfg), "two\n")
+        self.assertTrue((self.library / "v1.2.md").is_file())
+
+    def test_write_leaves_no_temp_file(self):
+        grimoire.write_page("note", "hi", self.cfg)
+        grimoire.write_page("note", "again", self.cfg)
+        names = sorted(p.name for p in self.library.iterdir())
+        self.assertEqual([n for n in names if n.endswith(".tmp")], [])
+        self.assertIn("note.md", names)
+
+    def test_write_keeps_page_mode(self):
+        page = self.library / "private.md"
+        page.write_text("x\n")
+        os.chmod(page, 0o600)
+        grimoire.write_page("private", "y", self.cfg)
+        self.assertEqual(page.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(page.read_text(), "y\n")
+
+    def test_new_page_follows_umask(self):
+        old = os.umask(0o022)
+        try:
+            grimoire.write_page("fresh", "x", self.cfg)
+        finally:
+            os.umask(old)
+        self.assertEqual((self.library / "fresh.md").stat().st_mode & 0o777, 0o644)
+
+    def test_failed_write_keeps_old_page_and_no_temp(self):
+        grimoire.write_page("note", "old", self.cfg)
+        from unittest import mock
+        with mock.patch.object(grimoire.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                grimoire.write_page("note", "new", self.cfg)
+        self.assertEqual((self.library / "note.md").read_text(), "old\n")
+        self.assertEqual([p.name for p in self.library.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_markdown_suffix_page_is_reachable(self):
+        (self.library / "notes.markdown").write_text("hi\n")
+        self.assertEqual(grimoire.read_page("notes", self.cfg), "hi\n")
+        grimoire.write_page("notes", "there", self.cfg)
+        self.assertEqual((self.library / "notes.markdown").read_text(), "there\n")
+        self.assertFalse((self.library / "notes.md").exists())
+
+    def test_atomic_write_keeps_symlink(self):
+        real = self.library / "real.md"
+        real.write_text("old\n")
+        link = self.library / "link.md"
+        link.symlink_to(real)
+        grimoire.atomic_write(link, b"new\n")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(real.read_text(), "new\n")
+
+    def test_atomic_write_keeps_hard_link(self):
+        page = self.library / "page.md"
+        page.write_text("old\n")
+        other = self.library / "other.md"
+        os.link(page, other)
+        grimoire.atomic_write(page, b"new\n")
+        self.assertEqual(other.read_text(), "new\n")
+
+    def test_mcp_survives_non_object_lines(self):
+        import io
+        lines = [
+            "[1]", "5", '"x"', "not json",
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json.dumps({"jsonrpc": "2.0", "id": 3, "method": "nope"}),
+            json.dumps({"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": "x"}),
+            json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": [1]}),
+        ]
+        out = io.StringIO()
+        old_in, old_out = sys.stdin, sys.stdout
+        sys.stdin, sys.stdout = io.StringIO("\n".join(lines) + "\n"), out
+        try:
+            grimoire.serve_mcp()
+        finally:
+            sys.stdin, sys.stdout = old_in, old_out
+        replies = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual([r["id"] for r in replies], [1, 2, 3, 4, 5])
+        self.assertEqual(replies[0]["result"], {})
+        self.assertEqual(len(replies[1]["result"]["tools"]), len(grimoire.MCP_TOOLS))
+        self.assertEqual(replies[2]["error"]["code"], -32601)
+        self.assertEqual(replies[3]["result"]["protocolVersion"], "2024-11-05")
+        self.assertTrue(replies[4]["result"]["isError"])
 
 
 if __name__ == "__main__":

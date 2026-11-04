@@ -43,7 +43,7 @@ Config is `~/.grimoire/config.json`:
 }
 ```
 
-`open` is `cwd`, `library`, or a path. esc leaves a file or a folder. q quits. On the shelf, `n` makes a page and `N` makes a folder. `/` finds a file by name. Inside a page, `/` finds text. ? opens the keys and settings menu. The bottom bar shows only the hints that fit. A narrow pane keeps the first ones and `?`.
+`open` is `cwd`, `library`, or a path. esc leaves a file or a folder. ctrl+q quits. On the shelf, `n` makes a page and `N` makes a folder. `/` finds a file by name. Inside a page, `/` finds text. ? opens the keys and settings menu. The bottom bar shows only the hints that fit. A narrow pane keeps the first ones and `?`.
 
 `.csv` and `.tsv` files open as a grid. The header row stays on top and the first column stays on the left while you scroll. Arrows move one cell at a time, and numbers are right-aligned. The footer shows the full value of the cell you are on. `v` flips to record view: one row at a time, with the header names down the left. In record view, up and down move between fields, and left and right move between records. Enter edits the cell you are on in the footer. Enter again keeps the change, and Esc cancels. Only that cell's text changes: quotes are added only when the value needs them (a comma, a tab, or a quote mark), and the rest of the line stays byte-for-byte. `i` edits the raw line, for a quoted value that spans several lines. Save keeps the file's own line endings (`\n` or `\r\n`) and whether it ends with one.
 
