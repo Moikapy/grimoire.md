@@ -437,6 +437,17 @@ class ParseTests(unittest.TestCase):
             self.assertEqual(saved["name"], "GRIMOIRE")
             self.assertTrue(path.is_file())
 
+    def test_ctrl_q_quits_and_q_does_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["GRIMOIRE_KEYS"] = str(Path(tmp) / "none.json")
+            try:
+                app = App(Path(tmp))
+                self.assertEqual(grimoire.parse_key("ctrl+q"), 17)
+                self.assertTrue(app.handle(ord("q")))
+                self.assertFalse(app.handle(17))
+            finally:
+                os.environ.pop("GRIMOIRE_KEYS", None)
+
     def test_keys_file_rebinds_quit(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "keys.json"
@@ -445,7 +456,7 @@ class ParseTests(unittest.TestCase):
             try:
                 app = App(Path(tmp))
                 self.assertNotEqual(grimoire.parse_key("G"), grimoire.parse_key("g"))
-                self.assertTrue(app.handle(ord("q")))
+                self.assertTrue(app.handle(17))  # ctrl+q no longer quits once keys.json rebinds it
                 self.assertEqual(app.mode, "list")
                 self.assertFalse(app.handle(ord("x")))
             finally:

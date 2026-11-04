@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -314,7 +315,7 @@ def key_codes(name: str) -> set[int]:
 # ctrl+c always quits, even if this file never mentions it.
 DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
     "list": {
-        "quit": ["q"],
+        "quit": ["ctrl+q"],
         "back": ["esc", "left", "h"],
         "up": ["up", "k"],
         "down": ["down", "j"],
@@ -326,7 +327,7 @@ DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
     },
     "normal": {
         "leave": ["esc"],
-        "quit": ["q"],
+        "quit": ["ctrl+q"],
         "insert": ["i"],
         "append": ["a"],
         "up": ["up", "k"],
@@ -3019,7 +3020,20 @@ def serve_mcp() -> None:
         sys.stdout.flush()
 
 
+def no_flow_control() -> None:
+    """ctrl+s and ctrl+q reach the app instead of pausing and resuming the terminal. endwin puts the shell's setting back."""
+    try:
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[0] &= ~termios.IXON
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        curses.def_prog_mode()  # coming back from ctrl+z keeps it off
+    except (termios.error, curses.error, OSError, ValueError):
+        pass
+
+
 def main(stdscr: curses.window, app: App) -> None:
+    no_flow_control()
     curses.curs_set(0)
     init_colors()
     stdscr.keypad(True)
