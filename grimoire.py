@@ -181,10 +181,62 @@ def write_default_theme(path: Path | None = None) -> Path:
     return dest
 
 
+def atomic_write(path: Path, data: bytes) -> None:
+    """A crash mid-write leaves the old file, not half of the new one.
+
+    Writes through a symlink to its target and keeps the old file's mode and owner.
+    A hard-linked file, or a folder we cannot make a temp file in, is written in place.
+    """
+    path = Path(os.path.realpath(path))
+    try:
+        old = path.stat()
+    except FileNotFoundError:
+        old = None
+    if old is not None and old.st_nlink > 1:
+        path.write_bytes(data)  # a new inode would cut the other links
+        return
+    try:
+        fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    except PermissionError:
+        path.write_bytes(data)
+        return
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if old is None:
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp, 0o666 & ~umask)
+        else:
+            os.chmod(tmp, old.st_mode & 0o7777)
+            if (old.st_uid, old.st_gid) != (os.getuid(), os.getgid()):
+                try:
+                    os.chown(tmp, old.st_uid, old.st_gid)
+                except PermissionError:
+                    pass
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    try:
+        folder = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(folder)
+    except OSError:
+        pass
+    finally:
+        os.close(folder)
+
+
 def save_config(cfg: dict[str, str]) -> Path:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    atomic_write(path, (json.dumps(cfg, indent=2) + "\n").encode("utf-8"))
     return path
 
 
@@ -874,7 +926,7 @@ def graph_path(library: Path) -> Path:
 
 def write_graph(library: Path) -> Path:
     path = graph_path(library)
-    path.write_text(json.dumps(build_graph(library), indent=2) + "\n", encoding="utf-8")
+    atomic_write(path, (json.dumps(build_graph(library), indent=2) + "\n").encode("utf-8"))
     return path
 
 
@@ -1805,7 +1857,7 @@ class App:
         if text and getattr(self, "final_newline", True) and not text.endswith(newline):
             text += newline
         try:
-            self.path.write_bytes(text.encode("utf-8"))
+            atomic_write(self.path, text.encode("utf-8"))
         except OSError as exc:
             self.message = f"save failed: {exc}"
             return False
@@ -2784,7 +2836,14 @@ def page_file(slug: str, library: Path) -> Path:
     rel = Path(raw)
     if not raw or rel.is_absolute() or ".." in rel.parts or any(part.startswith(".") for part in rel.parts):
         raise ValueError(f"bad page {slug}")
-    path = (library / rel).with_name(rel.name + ".md").resolve()  # with_suffix would turn v1.2 into v1.md
+    base = library / rel
+    path = base.with_name(rel.name + ".md")  # with_suffix would turn v1.2 into v1.md
+    for suffix in (".md", ".markdown"):  # an existing notes.markdown is the page notes
+        found = base.with_name(rel.name + suffix)
+        if found.is_file():
+            path = found
+            break
+    path = path.resolve()
     path.relative_to(library.resolve())
     return path
 
@@ -2810,38 +2869,6 @@ def read_page(slug: str, cfg: dict[str, str] | None = None) -> str:
     if not path.is_file():
         raise FileNotFoundError(slug)
     return path.read_text(encoding="utf-8")
-
-
-def atomic_write(path: Path, data: bytes) -> None:
-    """A crash mid-write leaves the old file, not half of the new one. Keeps the old file's mode."""
-    try:
-        mode = path.stat().st_mode & 0o7777
-    except FileNotFoundError:
-        umask = os.umask(0)
-        os.umask(umask)
-        mode = 0o666 & ~umask
-    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    tmp = Path(name)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    try:
-        folder = os.open(path.parent, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(folder)
-    except OSError:
-        pass
-    finally:
-        os.close(folder)
 
 
 def write_page(slug: str, text: str, cfg: dict[str, str] | None = None) -> dict[str, str]:

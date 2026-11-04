@@ -651,6 +651,30 @@ class AgentTests(unittest.TestCase):
         self.assertEqual((self.library / "note.md").read_text(), "old\n")
         self.assertEqual([p.name for p in self.library.iterdir() if p.name.endswith(".tmp")], [])
 
+    def test_markdown_suffix_page_is_reachable(self):
+        (self.library / "notes.markdown").write_text("hi\n")
+        self.assertEqual(grimoire.read_page("notes", self.cfg), "hi\n")
+        grimoire.write_page("notes", "there", self.cfg)
+        self.assertEqual((self.library / "notes.markdown").read_text(), "there\n")
+        self.assertFalse((self.library / "notes.md").exists())
+
+    def test_atomic_write_keeps_symlink(self):
+        real = self.library / "real.md"
+        real.write_text("old\n")
+        link = self.library / "link.md"
+        link.symlink_to(real)
+        grimoire.atomic_write(link, b"new\n")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(real.read_text(), "new\n")
+
+    def test_atomic_write_keeps_hard_link(self):
+        page = self.library / "page.md"
+        page.write_text("old\n")
+        other = self.library / "other.md"
+        os.link(page, other)
+        grimoire.atomic_write(page, b"new\n")
+        self.assertEqual(other.read_text(), "new\n")
+
     def test_mcp_survives_non_object_lines(self):
         import io
         lines = [
