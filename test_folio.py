@@ -591,5 +591,132 @@ class ParseTests(unittest.TestCase):
                 grimoire.page_file("../outside", library)
 
 
+class GraphTests(unittest.TestCase):
+    def setUp(self):
+        old = grimoire.THEME_PAIRS.copy()
+        self.old_theme = old
+        grimoire.THEME_PAIRS.clear()
+
+    def tearDown(self):
+        grimoire.THEME_PAIRS.clear()
+        grimoire.THEME_PAIRS.update(self.old_theme)
+
+    @staticmethod
+    def pages(d: dict) -> dict:
+        base = {
+            "path": "",
+            "title": "",
+            "links": [],
+            "missing": [],
+            "backlinks": [],
+        }
+        return {slug: {**base, **spec} for slug, spec in d.items()}
+
+    def test_braille_bits_and_rows(self):
+        canvas = grimoire.canvas_new()
+        grimoire.canvas_plot(canvas, 0, 0)
+        grimoire.canvas_plot(canvas, 1, 0)
+        grimoire.canvas_plot(canvas, 0, 3)
+        grimoire.canvas_plot(canvas, 1, 3)
+        self.assertEqual(canvas[(0, 0)], 0x01 | 0x08 | 0x40 | 0x80)
+        self.assertEqual(grimoire.braille_char(0x01), "\u2801")
+        self.assertEqual(grimoire.braille_char(0x40), "\u2840")
+        self.assertEqual(grimoire.braille_char(0), "\u2800")
+        line = grimoire.canvas_new()
+        grimoire.canvas_line(line, 0, 0, 6, 0)
+        rows = grimoire.canvas_rows(line, 5, 1)
+        # a horizontal line fills the left and right dot of every cell
+        self.assertEqual(rows, ["\u2809\u2809\u2809\u2801"])
+
+    def test_layout_deterministic_and_linked_closer(self):
+        data = {
+            "pages": self.pages({
+                "a": {"links": ["b"], "backlinks": ["b"]},
+                "b": {"links": ["a"], "backlinks": ["a"]},
+                "c": {"links": [], "backlinks": []},
+            })
+        }
+
+        def run():
+            state = {
+                "pos": grimoire.seed_positions(["a", "b", "c"]),
+                "vel": {},
+                "edges": [("a", "b")],
+                "links": {},
+            }
+            state["vel"] = {slug: (0.0, 0.0) for slug in state["pos"]}
+            state["links"] = grimoire.link_map(state["edges"])
+            grimoire.settle_layout(state, max_steps=200)
+            return {slug: tuple(round(v, 6) for v in xy) for slug, xy in state["pos"].items()}
+
+        first, second = run(), run()
+        self.assertEqual(first, second)
+        linked = math_dist(first["a"], first["b"])
+        loose = math_dist(first["a"], first["c"])
+        self.assertLess(linked, loose)
+
+    def test_cone_pick_moves_to_the_right_node(self):
+        screen = {
+            "center": (10.0, 10.0),
+            "above": (11.0, 0.0),
+            "below": (9.0, 20.0),
+            "far_right": (60.0, 70.0),
+            "slant": (30.0, 4.0),
+        }
+        self.assertEqual(grimoire.cone_pick(screen, "center", (0, -1)), "above")
+        # the aligned near node beats a distant one in the same cone
+        self.assertEqual(grimoire.cone_pick(screen, "center", (1, 0)), "slant")
+        self.assertEqual(grimoire.cone_pick(screen, "center", (0, 1)), "below")
+        # no node in that direction: stay
+        self.assertEqual(grimoire.cone_pick({"solo": (5.0, 5.0)}, "solo", (0, -1)), "solo")
+
+    def test_label_placement(self):
+        items = [
+            ("sel", 0.0, 20.0, 40.0, 2.0, "Sel"),
+            ("one", 1.0, 40.0, 60.0, 1.5, "One"),
+            ("two", 2.0, 24.0, 39.0, 1.0, "Two"),
+            ("wide", 0.5, 2.0, 30.0, 1.0, "Very Long Label Here"),
+        ]
+        placed = grimoire.place_labels(items, 80, 20, {"sel", "one"})
+        rects = [(col - 1, row - 1, col + len(text) + 1, row + 1) for _, col, row, text in placed]
+        for i, a in enumerate(rects):
+            for b in rects[i + 1:]:
+                self.assertFalse(a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1])
+        got = {slug for slug, _, _, _ in placed}
+        self.assertIn("sel", got)
+        self.assertIn("one", got)
+
+    def test_flow_through_the_app(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            library = root / "pages"
+            library.mkdir()
+            (library / "index.md").write_text("# Index\n\nSee [[beta]].\n", encoding="utf-8")
+            (library / "beta.md").write_text("# Beta\n\nBack to [[index]].\n", encoding="utf-8")
+            cfg_path = root / "cfg.json"
+            cfg_path.write_text(json.dumps({"name": "GRIMOIRE", "open": "library", "library": str(library)}), encoding="utf-8")
+            os.environ["GRIMOIRE_CONFIG"] = str(cfg_path)
+            try:
+                app = App(root)
+                self.assertEqual(app.mode, "list")
+                app.handle(ord("g"))
+                self.assertEqual(app.mode, "graph")
+                self.assertEqual(app.gsel, "index")
+                self.assertTrue(app.handle(10))
+                self.assertEqual(app.mode, "read")
+                self.assertEqual(app.path.name, "index.md")
+                self.assertTrue(app.handle(27))
+                self.assertEqual(app.mode, "graph")
+                self.assertTrue(app.handle(27))
+                self.assertEqual(app.mode, "list")
+            finally:
+                os.environ.pop("GRIMOIRE_CONFIG", None)
+
+
+def math_dist(a, b):
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
 if __name__ == "__main__":
     unittest.main()
+
