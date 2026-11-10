@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+__version__ = "0.1.0"
+
 locale.setlocale(locale.LC_ALL, "")
 os.environ.setdefault("ESCDELAY", "25")
 
@@ -50,6 +52,7 @@ MARKDOWN_EXT = set(MD_SUFFIXES)
 REMOTE = ("http://", "https://", "mailto:")
 SKIP_DIRS = {"__pycache__", "node_modules", "dist", "build", ".venv", "venv"}
 MAX_LINES = 8000
+READ_ONLY = f"read-only: only the first {MAX_LINES} lines are loaded"
 CARD_W = 60
 
 # Styles the painter understands.
@@ -888,7 +891,11 @@ def list_pages(library: Path) -> dict[str, Path]:
         parts = path.relative_to(library).parts
         if any(part.startswith(".") for part in parts):
             continue
-        found[page_slug(path, library).lower()] = path
+        try:
+            slug = page_slug(path, library)
+        except ValueError:
+            continue  # a symlink that leaves the library is not a page
+        found[slug.lower()] = path
     return found
 
 
@@ -1440,6 +1447,8 @@ def open_image(note: Path, raw: str, tools: dict[str, str | None] | None = None,
         return "image path refused"
     if target is None:
         return "not a local image"
+    if target.suffix.lower() not in IMAGE_EXT:
+        return "not an image"  # the opener would run whatever handles the file
     if not target.is_file():
         return "image missing"
     found = tools or image_tools()
@@ -1497,7 +1506,9 @@ def doc_layout(
                     missing = not dest.startswith(REMOTE)
                 elif not target.is_file():
                     missing = True
-                else:
+                elif not Path(dest).is_absolute():
+                    # A page only previews pictures beside it. An absolute path
+                    # shows as a caption and opens on a keypress.
                     paint = preview if preview is not None else chafa_preview
                     rows = paint(target, inner) or []
             for line in rows:
@@ -1655,6 +1666,7 @@ class App:
         self.pref_col = 0
         self.query = ""
         self.note = ""
+        self.truncated = False
         self.message = ""
         self.dirty = False
         self.inserting = False
@@ -1726,6 +1738,7 @@ class App:
 
     def open_path(self, path: Path) -> None:
         self.lines, self.note = read_lines(path)
+        self.truncated = bool(self.note)
         self.newline, self.final_newline = line_style(path)
         self.fences = fence_flags(self.lines)
         self.path = path
@@ -1770,6 +1783,9 @@ class App:
     def begin_cell_edit(self) -> None:
         table = self.table()
         if table is None:
+            return
+        if self.truncated:
+            self.message = READ_ONLY
             return
         if self.lines[self.row].count('"') % 2:
             self.message = "multi-line cell, use i to edit raw"
@@ -1919,6 +1935,9 @@ class App:
     def save(self) -> bool:
         if self.path is None:
             self.message = "no file"
+            return False
+        if self.truncated:
+            self.message = READ_ONLY  # saving would drop every line past the cut
             return False
         newline = getattr(self, "newline", "\n")
         text = newline.join(self.lines)
@@ -2071,6 +2090,9 @@ class App:
         return True
 
     def begin_insert(self, *, append: bool) -> None:
+        if self.truncated:
+            self.message = READ_ONLY
+            return
         if self.delimiter and not append:
             self.col = cell_offset(self.lines[self.row], self.delimiter, self.tcol)
             self.pref_col = self.col
@@ -3545,6 +3567,7 @@ grimoire mcp               stdio MCP server for agents
 grimoire plugins          list plugins in ~/.grimoire/plugins
 grimoire images           which image tools are installed
 grimoire theme            write ~/.grimoire/theme.json if missing, then print it
+grimoire --version        print the version
 
 Config: ~/.grimoire/config.json
   name      text on the title row (default GRIMOIRE)
@@ -3862,7 +3885,7 @@ def serve_mcp() -> None:
             result = {
                 "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "grimoire", "version": "1.0.0"},
+                "serverInfo": {"name": "grimoire", "version": __version__},
             }
         elif method == "ping":
             result = {}
@@ -3931,6 +3954,9 @@ def run(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] in ("help", "--help", "-h"):
         print(USAGE, end="")
+        return
+    if args and args[0] in ("version", "--version", "-V"):
+        print(f"grimoire {__version__}")
         return
     if args and args[0] == "plugins":
         host = load_plugins()

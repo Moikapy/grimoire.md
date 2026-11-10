@@ -1051,6 +1051,84 @@ class GraphKeyAndFlowTests(unittest.TestCase):
                 self.restore_env(old)
 
 
+class HardeningTests(unittest.TestCase):
+    def test_truncated_file_is_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            big = root / "big.txt"
+            total = grimoire.MAX_LINES + 500
+            body = "".join(f"{n}\n" for n in range(total))
+            big.write_text(body, encoding="utf-8")
+            app = App(root, big, name="x")
+            self.assertEqual(len(app.lines), grimoire.MAX_LINES)
+            self.assertTrue(app.truncated)
+            app.begin_insert(append=False)
+            self.assertFalse(app.inserting)
+            self.assertEqual(app.message, grimoire.READ_ONLY)
+            self.assertFalse(app.save())
+            self.assertEqual(big.read_text(encoding="utf-8"), body)
+            small = root / "small.txt"
+            small.write_text("a\n", encoding="utf-8")
+            app.open_path(small)
+            self.assertFalse(app.truncated)
+            self.assertTrue(app.save())
+
+    def test_symlink_out_of_library_is_not_a_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            library = Path(tmp) / "lib"
+            outside = Path(tmp) / "out"
+            library.mkdir()
+            outside.mkdir()
+            (outside / "secret.md").write_text("# secret\n", encoding="utf-8")
+            (library / "home.md").write_text("# home\n", encoding="utf-8")
+            (library / "link.md").symlink_to(outside / "secret.md")
+            (library / "away").symlink_to(outside, target_is_directory=True)
+            self.assertEqual(list(grimoire.list_pages(library)), ["home"])
+            self.assertEqual(list(grimoire.build_graph(library)["pages"]), ["home"])
+
+    def test_open_image_refuses_a_file_that_is_not_an_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            note = Path(tmp) / "note.md"
+            script = Path(tmp) / "run.sh"
+            script.write_text("echo hi\n", encoding="utf-8")
+            seen = []
+            for raw in ("![x](run.sh)", f"![x]({script})"):
+                message = grimoire.open_image(
+                    note,
+                    raw,
+                    tools={"preview": None, "open": "/usr/bin/xdg-open"},
+                    spawn=lambda argv, **_kw: seen.append(argv),
+                )
+                self.assertEqual(message, "not an image")
+            self.assertEqual(seen, [])
+
+    def test_npm_and_python_versions_match(self):
+        package = json.loads((Path(grimoire.__file__).parent / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(package["version"], grimoire.__version__)
+
+    def test_absolute_image_path_is_not_previewed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            note = Path(tmp) / "notes" / "note.md"
+            note.parent.mkdir()
+            picture = Path(tmp) / "elsewhere.png"
+            picture.write_bytes(b"png")
+            seen = []
+            painted = doc_layout(
+                [f"![far]({picture})", "after"],
+                1,
+                0,
+                height=8,
+                width=200,
+                markdown=True,
+                note=note,
+                preview=lambda path, _width: seen.append(path) or ["@@@@"],
+            )
+            texts = ["".join(part for part, _ in spans) for _, _, spans in painted]
+            self.assertEqual(seen, [])
+            self.assertNotIn("@@@@", texts)
+            self.assertTrue(any(str(picture) in text and "(missing)" not in text for text in texts))
+
+
 if __name__ == "__main__":
     unittest.main()
 
