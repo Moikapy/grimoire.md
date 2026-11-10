@@ -1,6 +1,6 @@
 {
   "name": "grimoire-md",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Terminal reader for markdown notes and scripts, with a page graph and an MCP server. Needs Python 3.10 or newer.",
   "bin": {
     "grimoire": "bin/grimoire.js"

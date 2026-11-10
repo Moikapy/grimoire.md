@@ -16,7 +16,7 @@ grimoire --help
 uv tool upgrade grimoire-md   # later, to update
 ```
 
-The upgrade pulls the newest commit. It can say `Nothing to upgrade` when the version number has not changed, and still have updated.
+The upgrade pulls the newest commit. `grimoire --version` says what you have; the newest is the `version` line in [`package.json`](package.json).
 
 `pipx install git+https://github.com/Moikapy/grimoire.md` does the same with the Python you already have.
 
@@ -92,6 +92,12 @@ Config is `~/.grimoire/config.json`:
 Colors are `~/.grimoire/theme.json`. `grimoire theme` writes it if it is missing. Names are `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, and `default`. A number from 0 to 255 also works when the terminal has that color. The background is always the terminal's. The font is the terminal's too. Restart Grimoire after an edit.
 
 Plugins are plain Python files in `~/.grimoire/plugins`. Each one defines `register(api)`. A plugin runs with your full permissions the moment Grimoire starts, so only copy in files you have read. Core keys win. A handler returns False to quit the app. `grimoire plugins` lists what loaded. Copy `examples/linecount.py` there to try one: ctrl+w reports the line count.
+
+## Links
+
+In a markdown page, enter (or `o`) on a line with a link opens the page it names. `[[page]]`, `[[page|shown text]]`, and `[text](page.md)` all work. With several links on one line, it takes the one under the cursor, or the next one to its right. `[[page#heading]]` lands on that heading, and `[[#heading]]` jumps within the page.
+
+Esc goes back to the page and the line you came from. Follow three links and Esc unwinds all three, then returns to the graph or the shelf you started from. A page with unsaved edits asks you to save before it lets you leave through a link. A link to a page that does not exist says so in the footer. Web addresses are not opened.
 
 ## tmux, Herdr, ssh
 

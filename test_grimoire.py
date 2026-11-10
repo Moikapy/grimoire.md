@@ -1216,6 +1216,67 @@ class HardeningTests(unittest.TestCase):
                     else:
                         os.environ[name] = value
 
+    def test_links_on_a_line(self):
+        raw = "see [[a/b|label]] and `[[code]]` then [text](other.md#part) or [web](https://x.y) ![pic](p.png) [[#top]]"
+        found = [(page, heading) for _, _, page, heading in grimoire.links_on_line(raw)]
+        self.assertEqual(found, [("a/b", ""), ("other", "part"), ("", "top")])
+        self.assertEqual(grimoire.link_at(raw, 0), ("a/b", ""))
+        self.assertEqual(grimoire.link_at(raw, raw.index("[text]") + 2), ("other", "part"))
+        self.assertEqual(grimoire.link_at(raw, len(raw)), ("", "top"))
+        self.assertIsNone(grimoire.link_at("no links here", 0))
+        self.assertEqual(grimoire.heading_row(["# A", "text", "## Two Words!"], "two-words"), 2)
+
+    def test_follow_link_and_come_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            library = Path(tmp).resolve()
+            (library / "sub").mkdir()
+            home = library / "home.md"
+            other = library / "sub" / "other.md"
+            third = library / "third.md"
+            home.write_text("# Home\n\nintro\ngo to [[sub/other#Details]] now\nand [[nowhere]]\n", encoding="utf-8")
+            other.write_text("# Other\n\ntext\n\n## Details\n\nsee [third](../third.md)\n", encoding="utf-8")
+            third.write_text("# Third\n", encoding="utf-8")
+            old = {name: os.environ.get(name) for name in ("GRIMOIRE_LIBRARY", "GRIMOIRE_CONFIG", "GRIMOIRE_KEYS")}
+            os.environ["GRIMOIRE_LIBRARY"] = str(library)
+            os.environ["GRIMOIRE_CONFIG"] = str(library / "none.json")
+            os.environ["GRIMOIRE_KEYS"] = str(library / "nokeys.json")
+            try:
+                app = App(library, home, name="x")
+                app.row, app.col = 3, 2
+                app.handle(10)  # enter
+                self.assertEqual(app.path, other)
+                self.assertEqual(app.row, 4)  # the Details heading
+                app.row = 6
+                app.handle(10)
+                self.assertEqual(app.path, third)
+                app.handle(27)  # esc
+                self.assertEqual((app.path, app.row), (other, 6))
+                app.handle(27)
+                self.assertEqual((app.path, app.row, app.col), (home, 3, 2))
+                self.assertEqual(app.mode, "read")
+                app.row = 4
+                app.handle(10)
+                self.assertEqual(app.path, home)
+                self.assertEqual(app.message, "no page nowhere")
+                app.row = 3
+                app.begin_insert(append=True)
+                app.handle(ord("x"))
+                app.handle(27)
+                app.handle(10)
+                self.assertEqual(app.path, home)
+                self.assertEqual(app.message, "save first, then follow the link")
+                app.handle(26)  # undo
+                app.handle(27)
+                app.handle(ord("n")) if app.mode == "confirm" else None
+                self.assertEqual(app.mode, "list")
+                self.assertEqual(app.trail, [])
+            finally:
+                for name, value in old.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
     def test_image_opener_per_platform(self):
         have = {"imv": "/usr/bin/imv", "xdg-open": "/usr/bin/xdg-open", "open": "/usr/bin/open"}
         only_open = lambda name: have.get(name) if name == "open" else None

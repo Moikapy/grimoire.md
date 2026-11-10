@@ -21,6 +21,24 @@ uv tool install git+https://github.com/Moikapy/grimoire.md
 
 No `uv`: `pipx install git+https://github.com/Moikapy/grimoire.md`. To get `uv` itself: `brew install uv`, or see https://docs.astral.sh/uv/. Installing a tool changes the person's machine, so say what you are about to run before you run it.
 
+### Is it up to date?
+
+Check when you start work in a project that uses Grimoire, and again if a command in this file is refused as unknown:
+
+```sh
+grimoire --version
+curl -fsSL https://raw.githubusercontent.com/Moikapy/grimoire.md/master/package.json | grep '"version"'
+```
+
+If the second number is higher, tell the person Grimoire is out of date and offer to run the upgrade. Do not upgrade without saying so.
+
+```sh
+uv tool upgrade grimoire-md      # or: pipx upgrade grimoire-md
+```
+
+This file can go stale too. The newest copy is at
+https://raw.githubusercontent.com/Moikapy/grimoire.md/master/skills/grimoire/SKILL.md
+
 ## 2. Pick the library
 
 A library is one folder. By default it is `~/.grimoire/pages`, shared by everything on the machine. For a project, keep the pages in the repo so they are versioned with the code:
