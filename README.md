@@ -93,6 +93,10 @@ Colors are `~/.grimoire/theme.json`. `grimoire theme` writes it if it is missing
 
 Plugins are plain Python files in `~/.grimoire/plugins`. Each one defines `register(api)`. A plugin runs with your full permissions the moment Grimoire starts, so only copy in files you have read. Core keys win. A handler returns False to quit the app. `grimoire plugins` lists what loaded. Copy `examples/linecount.py` there to try one: ctrl+w reports the line count.
 
+## Mouse
+
+The scroll wheel moves through a page three lines at a time, through a table by rows, and through the shelf and the keys menu. In the graph it zooms, and a click selects a node. Nothing needs the mouse.
+
 ## Links
 
 In a markdown page, enter (or `o`) on a line with a link opens the page it names. `[[page]]`, `[[page|shown text]]`, and `[text](page.md)` all work. With several links on one line, it takes the one under the cursor, or the next one to its right. `[[page#heading]]` lands on that heading, and `[[#heading]]` jumps within the page.

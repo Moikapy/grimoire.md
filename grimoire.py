@@ -1489,6 +1489,10 @@ def image_caption(alt: str, dest: str, *, missing: bool = False) -> str:
     return label + ("  (missing)" if missing else "")
 
 
+WHEEL_UP = curses.BUTTON4_PRESSED
+WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0x200000)  # older curses builds do not name it
+WHEEL_LINES = 3
+
 OSC52_MAX = 100_000  # terminals drop a longer clipboard sequence
 
 
@@ -2315,6 +2319,8 @@ class App:
             return True
         if key == 3:
             return False
+        if key == curses.KEY_MOUSE:
+            return self.mouse()
         if self.mode == "help":
             if self.keys.pressed("help", "close", key):
                 self.mode = self.help_from
@@ -2846,21 +2852,41 @@ class App:
             self.gquery += typed(key)
         return True
 
-    def graph_mouse(self) -> bool:
-        try:
-            _, x, y, _, bstate = curses.getmouse()
-        except curses.error:
+    def mouse(self, event=None) -> bool:
+        """The wheel scrolls every view. In the graph it zooms, and a click selects."""
+        if event is None:
+            try:
+                event = curses.getmouse()
+            except curses.error:
+                return True
+        _, x, y, _, bstate = event
+        if self.mode == "graph":
+            return self.graph_mouse(x, y, bstate)
+        step = -1 if bstate & WHEEL_UP else 1 if bstate & WHEEL_DOWN else 0
+        if not step:
             return True
+        if self.mode == "help":
+            self.help_at = max(0, self.help_at + step * WHEEL_LINES)
+        elif self.mode in ("list", "filter"):
+            self.selected = max(0, min(max(0, len(self.listing()) - 1), self.selected + step))
+        elif self.mode == "read":
+            if self.table_view():
+                self.move_cell(step * WHEEL_LINES, 0)
+            else:
+                self.move_row(step * WHEEL_LINES)
+        return True
+
+    def graph_mouse(self, x: int, y: int, bstate: int) -> bool:
         cols, rows = self.glast
         view = self.gview
         st = self.gstate
         if st is None or view is None:
             return True
         dot = ((x + 0.5) * 2, (y + 0.5) * 4)
-        if bstate & curses.BUTTON4_PRESSED:
+        if bstate & WHEEL_UP:
             self.gview = zoom_view(view, 1.25, dot[0], dot[1], cols, rows - 1)
             return True
-        if bstate & curses.BUTTON5_PRESSED:
+        if bstate & WHEEL_DOWN:
             self.gview = zoom_view(view, 0.8, dot[0], dot[1], cols, rows - 1)
             return True
         if bstate & (curses.BUTTON1_DOUBLE_CLICKED | curses.BUTTON1_TRIPLE_CLICKED):

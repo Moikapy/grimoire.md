@@ -1356,6 +1356,46 @@ class HardeningTests(unittest.TestCase):
                 else:
                     os.environ["GRIMOIRE_KEYS"] = old
 
+    def test_mouse_wheel_scrolls_the_page_and_the_shelf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "note.md"
+            page.write_text("".join(f"line {n}\n" for n in range(20)), encoding="utf-8")
+            for name in ("a.md", "b.md", "c.md"):
+                (root / name).write_text("# x\n", encoding="utf-8")
+            old = os.environ.get("GRIMOIRE_KEYS")
+            os.environ["GRIMOIRE_KEYS"] = str(root / "nokeys.json")
+            up = (0, 5, 5, 0, grimoire.WHEEL_UP)
+            down = (0, 5, 5, 0, grimoire.WHEEL_DOWN)
+            try:
+                app = App(root, page, name="x")
+                app.mouse(down)
+                self.assertEqual(app.row, grimoire.WHEEL_LINES)
+                app.mouse(down)
+                app.mouse(up)
+                self.assertEqual(app.row, grimoire.WHEEL_LINES)
+                for _ in range(5):
+                    app.mouse(up)
+                self.assertEqual(app.row, 0)
+                for _ in range(20):
+                    app.mouse(down)
+                self.assertEqual(app.row, len(app.lines) - 1)
+                app.mouse((0, 5, 5, 0, curses.BUTTON1_PRESSED))
+                self.assertEqual(app.row, len(app.lines) - 1)
+                app.handle(27)
+                self.assertEqual(app.mode, "list")
+                at = app.selected
+                app.mouse(up)
+                self.assertEqual(app.selected, max(0, at - 1))
+                for _ in range(10):
+                    app.mouse(down)
+                self.assertEqual(app.selected, len(app.listing()) - 1)
+            finally:
+                if old is None:
+                    os.environ.pop("GRIMOIRE_KEYS", None)
+                else:
+                    os.environ["GRIMOIRE_KEYS"] = old
+
     def test_image_opener_per_platform(self):
         have = {"imv": "/usr/bin/imv", "xdg-open": "/usr/bin/xdg-open", "open": "/usr/bin/open"}
         only_open = lambda name: have.get(name) if name == "open" else None
