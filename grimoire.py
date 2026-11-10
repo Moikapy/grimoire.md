@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 try:
     import curses
@@ -951,6 +951,66 @@ def links_in(text: str) -> list[str]:
     return found
 
 
+_WIKI_LINK = re.compile(r"\[\[([^\]|#]*)(?:#([^\]|]*))?(?:\|[^\]]*)?\]\]")
+_MD_LINK = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
+
+
+def links_on_line(raw: str) -> list[tuple[int, int, str, str]]:
+    """Page links on one line, left to right: (start, end, page, heading).
+
+    Code spans are skipped, and so are images and web addresses.
+    """
+    masked = re.sub(r"`[^`]*`", lambda m: " " * len(m.group(0)), raw)
+    found: list[tuple[int, int, str, str]] = []
+    for match in _WIKI_LINK.finditer(masked):
+        page = match.group(1).strip()
+        heading = (match.group(2) or "").strip()
+        if page or heading:
+            found.append((match.start(), match.end(), page, heading))
+    for match in _MD_LINK.finditer(masked):
+        dest = match.group(1).strip()
+        if dest.startswith(REMOTE) or Path(dest).suffix.lower() in IMAGE_EXT:
+            continue
+        page, _, heading = dest.partition("#")
+        page = strip_suffix(page.strip()).removeprefix("./").strip()
+        if page or heading:
+            found.append((match.start(), match.end(), page, heading.strip()))
+    return sorted(found)
+
+
+def link_at(raw: str, col: int) -> tuple[str, str] | None:
+    """The link under the cursor, or the next one to its right, or the last one on the line."""
+    links = links_on_line(raw)
+    if not links:
+        return None
+    for start, end, page, heading in links:
+        if col < end:
+            return page, heading
+    return links[-1][2], links[-1][3]
+
+
+def link_target(note: Path, page: str, roots: list[Path]) -> Path | None:
+    """The file a link names: a page of the library first, then a file beside the note."""
+    key = page.lower().replace("\\", "/").strip("/")
+    for root in roots:
+        hit = list_pages(root).get(key)
+        if hit is not None:
+            return hit
+    for suffix in ("", *MD_SUFFIXES):
+        beside = note.parent / (page + suffix)
+        if is_text_file(beside):
+            return beside.resolve()
+    return None
+
+
+def heading_row(lines: list[str], heading: str) -> int | None:
+    want = re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-")
+    for index, line in enumerate(lines):
+        if line.startswith("#") and re.sub(r"[^a-z0-9]+", "-", line.lstrip("#").lower()).strip("-") == want:
+            return index
+    return None
+
+
 def _unique(items: list[str]) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -1639,7 +1699,7 @@ def help_lines(name: str, keys: KeyMap | None = None) -> tuple[str, ...]:
         "Reader, normal",
         f"  {bound.show('normal', 'left')} {bound.show('normal', 'down')} {bound.show('normal', 'up')} {bound.show('normal', 'right')}   move",
         f"  {bound.show('normal', 'insert')}   insert at the cursor",
-        f"  {bound.show('normal', 'view')}   view the image on this line",
+        f"  {bound.show('normal', 'view')}   follow the link on this line, or view its image",
         f"  {bound.show('normal', 'append')}   append, then type",
         f"  {bound.show('normal', 'record')}   .csv/.tsv: grid or one record at a time",
         f"  {bound.show('normal', 'view')}   .csv/.tsv: edit the cell; {bound.show('normal', 'insert')} edits the raw line",
@@ -1738,6 +1798,7 @@ class App:
         self.gquery = ""
         self.graph_from = "list"
         self.graph_return = False
+        self.trail: list[tuple[Path, int, int]] = []  # pages a followed link was opened from
         self.glast: tuple[int, int] = (80, 24)
         self.gshown: dict | None = None
         if open_file is not None:
@@ -2013,9 +2074,60 @@ class App:
         self.row = min(row, len(self.lines) - 1)
         self.message = "reloaded"
 
+    def follow_link(self) -> bool:
+        """Open the page the link on this line names. step_back returns here."""
+        if self.path is None:
+            return False
+        link = link_at(self.lines[self.row], self.col)
+        if link is None:
+            return False
+        page, heading = link
+        target = self.path
+        if page:
+            roots = [self.root]
+            try:
+                roots.insert(0, library_path(load_config()))
+            except OSError:
+                pass
+            found = link_target(self.path, page, roots)
+            if found is None:
+                self.message = f"no page {page}"
+                return True
+            target = found
+        if target != self.path:
+            if self.dirty:
+                self.message = "save first, then follow the link"
+                return True
+            self.trail.append((self.path, self.row, self.col))
+            self.open_path(target)
+        if heading:
+            row = heading_row(self.lines, heading)
+            if row is None:
+                self.message = f"no heading {heading}"
+            else:
+                self.row, self.col, self.pref_col = row, 0, 0
+        return True
+
+    def step_back(self) -> bool:
+        """One step out of a page: the page a link came from, then the graph, then the shelf."""
+        while self.trail:
+            path, row, col = self.trail.pop()
+            if not path.is_file():
+                continue
+            self.dirty = False
+            self.open_path(path)
+            self.row = min(row, len(self.lines) - 1)
+            self.col = min(col, len(self.lines[self.row]))
+            self.pref_col = self.col
+            return True
+        if self.graph_return:
+            return self.back_to_graph()
+        return self.leave_reader()
+
     def leave_reader(self) -> bool:
         if self.plugins:
             self.plugins.emit("leave", self)
+        self.trail.clear()
         self.mode = "list"
         self.dirty = False
         self.message = ""
@@ -2059,6 +2171,7 @@ class App:
             self.selected = 0
             self.refresh()
             return
+        self.trail.clear()
         self.open_path(entry.path)
 
     def title(self) -> str:
@@ -2252,11 +2365,7 @@ class App:
                 self.mode = "confirm"
                 self.message = "leave"
                 return True
-            if self.graph_return and leaving:
-                self.graph_return = False
-                self.mode = "graph"
-                return True
-            return self.leave_reader() if leaving else False
+            return self.step_back() if leaving else False
         if self.keys.pressed("normal", "graph", key):
             return self.open_graph()
         if self.keys.pressed("normal", "find", key):
@@ -2280,6 +2389,8 @@ class App:
                 note = open_image(self.path, self.lines[self.row])
                 if note:
                     self.message = note
+                elif self.markdown:
+                    self.follow_link()
             return True
         if self.keys.pressed("normal", "bottom", key):
             self.row = len(self.lines) - 1
@@ -2314,9 +2425,8 @@ class App:
                 self.message = "reloaded"
                 return True
             if self.save():
-                if self.graph_return:
-                    return self.back_to_graph()
-                return self.leave_reader()
+                self.mode = "read"
+                return self.step_back()
             self.mode = "read"
             return True
         if self.keys.pressed("confirm", "no", key):
@@ -2324,9 +2434,8 @@ class App:
                 self.mode = "read"
                 self.message = ""
                 return True
-            if self.graph_return:
-                return self.back_to_graph()
-            return self.leave_reader()
+            self.mode = "read"
+            return self.step_back()
         if self.keys.pressed("confirm", "stay", key):
             self.mode = "read"
             self.message = ""
@@ -2494,6 +2603,7 @@ class App:
             self.message = "no page behind that node"
             return True
         self.graph_return = True
+        self.trail.clear()
         self.message = ""
         self.open_path(Path(node["path"]))
         return True
