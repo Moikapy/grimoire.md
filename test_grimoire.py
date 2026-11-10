@@ -1194,6 +1194,28 @@ class HardeningTests(unittest.TestCase):
         self.assertIsNone(grimoire.pick_term(nothing, env))
         self.assertEqual(env["TERM"], "weird")
 
+    def test_read_and_write_refuse_in_one_line(self):
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            old = {name: os.environ.get(name) for name in ("GRIMOIRE_LIBRARY", "GRIMOIRE_CONFIG")}
+            os.environ["GRIMOIRE_LIBRARY"] = tmp
+            os.environ["GRIMOIRE_CONFIG"] = str(Path(tmp) / "none.json")
+            try:
+                for argv in (["read", "nope"], ["read", "../x"]):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as stop:
+                        grimoire.run(argv)
+                    self.assertEqual(stop.exception.code, 1)
+                    self.assertEqual(err.getvalue().strip(), f"grimoire: no page {argv[1]}")
+            finally:
+                for name, value in old.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
     def test_image_opener_per_platform(self):
         have = {"imv": "/usr/bin/imv", "xdg-open": "/usr/bin/xdg-open", "open": "/usr/bin/open"}
         only_open = lambda name: have.get(name) if name == "open" else None

@@ -8,7 +8,7 @@ The name is the lore. Phylactery is already Lich's session files, and Ossuary is
 
 Runs on Linux, macOS, and Windows. Needs Python 3.10 or newer and nothing else (Windows also pulls in `windows-curses`, automatically).
 
-Straight from GitHub, no registry needed. [uv](https://docs.astral.sh/uv/) brings its own Python:
+Straight from GitHub, no registry needed. [uv](https://docs.astral.sh/uv/) installs Python programs the way `npm install -g` installs Node ones: each tool gets its own environment and its command lands on your PATH. It also downloads a suitable Python by itself, so the one your system ships does not matter. Get it with `brew install uv`, or `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 
 ```sh
 uv tool install git+https://github.com/Moikapy/grimoire.md
@@ -42,7 +42,36 @@ grimoire setup            # shelf path and the name on screen
 
 Keys are `~/.grimoire/keys.json`. `grimoire keys` writes it if it is missing. Action names stay fixed. You change the key list. ctrl+c always quits.
 
+## Agents
+
 Agents do not open the reader. They use `grimoire pages`, `grimoire read`, `grimoire search`, and `grimoire write`. `grimoire mcp` is the same calls over stdio for an MCP client.
+
+[`skills/grimoire/SKILL.md`](skills/grimoire/SKILL.md) is a skill that teaches an agent to install Grimoire, give a project its own library, and read and write pages safely. To hand a project to an agent, paste this:
+
+```text
+Set up Grimoire for this project. Follow the skill at
+https://github.com/Moikapy/grimoire.md/blob/master/skills/grimoire/SKILL.md
+Keep the pages in docs/grimoire, start an index page, and tell me what you wrote.
+```
+
+To have the skill on hand in every session, copy it in. For Claude Code:
+
+```sh
+mkdir -p ~/.claude/skills/grimoire
+curl -fsSL https://raw.githubusercontent.com/Moikapy/grimoire.md/master/skills/grimoire/SKILL.md \
+  -o ~/.claude/skills/grimoire/SKILL.md
+```
+
+Use `.claude/skills/grimoire/` inside a repo to share it with everyone on that project. Both links need the repo to be public; while it is private, copy the file from a clone instead.
+
+To connect the MCP server to one project:
+
+```sh
+claude mcp add grimoire -e GRIMOIRE_LIBRARY="$PWD/docs/grimoire" -- grimoire mcp
+```
+
+## Settings
+
 
 Config is `~/.grimoire/config.json`:
 
