@@ -1108,6 +1108,92 @@ class HardeningTests(unittest.TestCase):
         package = json.loads((Path(grimoire.__file__).parent / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(package["version"], grimoire.__version__)
 
+    def test_typed_text_is_not_only_ascii(self):
+        self.assertEqual(grimoire.typed(ord("a")), "a")
+        self.assertEqual(grimoire.typed("é"), "é")
+        self.assertEqual(grimoire.typed("語"), "語")
+        self.assertEqual(grimoire.typed(27), "")
+        self.assertEqual(grimoire.typed(curses.KEY_UP), "")
+        self.assertEqual(grimoire.typed("\x85"), "")
+
+    def test_read_key_keeps_ascii_as_ints(self):
+        class Screen:
+            def __init__(self, keys):
+                self.keys = list(keys)
+
+            def get_wch(self):
+                if not self.keys:
+                    raise curses.error("no input")
+                return self.keys.pop(0)
+
+        screen = Screen(["a", "\x1a", "\x1b", "é", "✓", curses.KEY_UP])
+        got = [grimoire.read_key(screen) for _ in range(7)]
+        self.assertEqual(got, [ord("a"), 26, 27, "é", "✓", curses.KEY_UP, -1])
+
+    def test_unicode_reaches_insert_search_and_undo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "note.md"
+            page.write_text("# T\n", encoding="utf-8")
+            old = os.environ.get("GRIMOIRE_KEYS")
+            os.environ["GRIMOIRE_KEYS"] = str(root / "nokeys.json")
+            try:
+                app = App(root, page, name="x")
+                app.begin_insert(append=False)
+                for key in ("h", "é", "✓"):
+                    app.handle(grimoire.read_key(type("S", (), {"get_wch": lambda self, k=key: k})()))
+                self.assertEqual(app.lines[0], "hé✓# T")
+                app.handle(27)
+                app.handle(26)  # ctrl+z
+                self.assertEqual(app.lines[0], "# T")
+                app.query = ""
+                self.assertTrue(app.take_query("ñ", "search"))
+                self.assertEqual(app.query, "ñ")
+            finally:
+                if old is None:
+                    os.environ.pop("GRIMOIRE_KEYS", None)
+                else:
+                    os.environ["GRIMOIRE_KEYS"] = old
+
+    @unittest.skipIf(grimoire.termios is None, "no termios")
+    def test_free_keys_releases_suspend_and_flow_control(self):
+        import pty
+        import termios
+
+        master, slave = pty.openpty()
+        try:
+            before = termios.tcgetattr(slave)
+            self.assertTrue(before[0] & termios.IXON)
+            grimoire.free_keys(slave)
+            after = termios.tcgetattr(slave)
+            off = bytes([os.fpathconf(slave, "PC_VDISABLE")])
+            self.assertFalse(after[0] & termios.IXON)
+            self.assertEqual(after[6][termios.VSUSP], off)
+            self.assertNotEqual(before[6][termios.VSUSP], off)
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_pick_term_falls_back_when_the_entry_is_missing(self):
+        def setup(name):
+            if name not in ("xterm-256color", "xterm"):
+                raise curses.error("setupterm: could not find terminal")
+
+        env = {"TERM": "tmux-256color"}
+        self.assertEqual(grimoire.pick_term(setup, env), "xterm-256color")
+        self.assertEqual(env["TERM"], "xterm-256color")
+        env = {"TERM": "xterm"}
+        self.assertEqual(grimoire.pick_term(setup, env), "xterm")
+        env = {}
+        self.assertEqual(grimoire.pick_term(setup, env), "xterm-256color")
+
+        def nothing(name):
+            raise curses.error("no")
+
+        env = {"TERM": "weird"}
+        self.assertIsNone(grimoire.pick_term(nothing, env))
+        self.assertEqual(env["TERM"], "weird")
+
     def test_image_opener_per_platform(self):
         have = {"imv": "/usr/bin/imv", "xdg-open": "/usr/bin/xdg-open", "open": "/usr/bin/open"}
         only_open = lambda name: have.get(name) if name == "open" else None

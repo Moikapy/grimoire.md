@@ -62,6 +62,21 @@ Colors are `~/.grimoire/theme.json`. `grimoire theme` writes it if it is missing
 
 Plugins are plain Python files in `~/.grimoire/plugins`. Each one defines `register(api)`. A plugin runs with your full permissions the moment Grimoire starts, so only copy in files you have read. Core keys win. A handler returns False to quit the app. `grimoire plugins` lists what loaded. Copy `examples/linecount.py` there to try one: ctrl+w reports the line count.
 
+## tmux, Herdr, ssh
+
+Grimoire runs inside a multiplexer or over ssh with nothing to set up. Text you type can be any script, not only ASCII.
+
+If `TERM` names a terminal the machine has no entry for (common inside tmux or over ssh from a newer terminal), Grimoire falls back to `xterm-256color` instead of failing.
+
+Two tmux settings are yours to make:
+
+```sh
+set -g mouse on          # clicks and the scroll wheel reach Grimoire
+set -sg escape-time 10   # older tmux waits half a second on esc
+```
+
+Without the mouse everything still works from the keys.
+
 ## Graph
 
 `g` on the shelf opens the graph of the whole library. ctrl+g on a page opens it with that page selected (`g` on a page still jumps to the top, like everywhere else). Pages that link to nothing still sit on their own: every node repels the others, links act as springs, and a little gravity pulls the whole thing to the middle. The same library settles in the same shape every time.

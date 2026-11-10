@@ -329,6 +329,27 @@ def parse_key(name: str) -> int:
     raise ValueError(f"unknown key {name}")
 
 
+def typed(key: int | str) -> str:
+    """The character a key types, or "" for a control or function key."""
+    if isinstance(key, int):
+        return chr(key) if 32 <= key < 127 else ""
+    return key if key.isprintable() else ""
+
+
+def read_key(stdscr) -> int | str:
+    """One key. ASCII and function keys are ints, as the key map expects.
+
+    Anything else typed (é, ✓, 語) comes back as the character itself. -1 is a timeout.
+    """
+    try:
+        key = stdscr.get_wch()
+    except curses.error:
+        return -1
+    if isinstance(key, str):
+        return ord(key) if len(key) == 1 and ord(key) < 128 else key
+    return key
+
+
 def key_codes(name: str) -> set[int]:
     """One name can be several bytes. Enter and backspace are not one code."""
     key = name.strip().lower()
@@ -464,8 +485,10 @@ class KeyMap:
         self.codes = codes
 
     def pressed(self, mode: str, action: str, key: int | str) -> bool:
-        if not isinstance(key, int):
-            return False
+        if isinstance(key, str):
+            if len(key) != 1:
+                return False
+            key = ord(key)  # a key list may name a letter like é
         return key in self.codes.get(mode, {}).get(action, ())
 
     def show(self, mode: str, action: str) -> str:
@@ -1731,8 +1754,8 @@ class App:
         if self.keys.pressed(mode, "erase", key):
             self.query = self.query[:-1]
             return True
-        if isinstance(key, int) and 32 <= key < 127:
-            self.query += chr(key)
+        if typed(key):
+            self.query += typed(key)
             return True
         return False
 
@@ -1842,8 +1865,8 @@ class App:
             return True
         if self.keys.pressed("search", "erase", key):
             self.cell_text = self.cell_text[:-1]
-        elif isinstance(key, int) and 32 <= key < 127:
-            self.cell_text += chr(key)
+        elif typed(key):
+            self.cell_text += typed(key)
         return True
 
     def move_cell(self, drow: int, dcol: int) -> None:
@@ -2217,8 +2240,8 @@ class App:
             hit = self.plugins.dispatch(self, "insert", key)
             if hit is not None:
                 return hit
-        if isinstance(key, int) and 32 <= key < 127:
-            self.insert_text(chr(key))
+        if typed(key):
+            self.insert_text(typed(key))
         return True
 
     def handle_normal(self, key: int | str) -> bool:
@@ -2318,7 +2341,7 @@ class App:
             if self.query:
                 self.jump_match(1)
             return True
-        if self.keys.pressed("search", "erase", key) or (isinstance(key, int) and 32 <= key < 127):
+        if self.keys.pressed("search", "erase", key) or typed(key):
             self.take_query(key, "search")
             return True
         return True
@@ -2568,8 +2591,8 @@ class App:
         if self.keys.pressed("gfilter", "erase", key):
             self.gquery = self.gquery[:-1]
             return True
-        if isinstance(key, int) and 32 <= key < 127:
-            self.gquery += chr(key)
+        if typed(key):
+            self.gquery += typed(key)
         return True
 
     def graph_mouse(self) -> bool:
@@ -3928,18 +3951,60 @@ def serve_mcp() -> None:
         sys.stdout.flush()
 
 
+def free_keys(fd: int) -> None:
+    """Hand the app the keys the terminal driver would keep for itself.
+
+    ctrl+s and ctrl+q stop pausing and resuming output. ctrl+z (undo) and, on macOS,
+    ctrl+y (redo) stop being the suspend keys: the driver swallows them otherwise,
+    even with the signal ignored.
+    """
+    attrs = termios.tcgetattr(fd)
+    attrs[0] &= ~termios.IXON
+    try:
+        off = os.fpathconf(fd, "PC_VDISABLE")
+    except (OSError, ValueError):
+        off = 0
+    for name in ("VSUSP", "VDSUSP"):
+        index = getattr(termios, name, None)
+        if index is not None and index < len(attrs[6]):
+            attrs[6][index] = bytes([off])
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
 def no_flow_control() -> None:
-    """ctrl+s and ctrl+q reach the app instead of pausing and resuming the terminal. endwin puts the shell's setting back."""
+    """endwin puts the shell's settings back."""
     if termios is None:
         return
     try:
-        fd = sys.stdin.fileno()
-        attrs = termios.tcgetattr(fd)
-        attrs[0] &= ~termios.IXON
-        termios.tcsetattr(fd, termios.TCSANOW, attrs)
-        curses.def_prog_mode()  # coming back from ctrl+z keeps it off
+        free_keys(sys.stdin.fileno())
+        curses.def_prog_mode()  # coming back from a suspend keeps them
     except (termios.error, curses.error, OSError, ValueError):
         pass
+
+
+TERM_FALLBACKS = ("xterm-256color", "xterm", "vt100")
+
+
+def pick_term(setup=None, env=None) -> str | None:
+    """A TERM this machine has an entry for. None when nothing works.
+
+    Inside tmux, or over ssh from a newer terminal, TERM can name an entry the
+    machine does not have. Close enough beats a traceback.
+    """
+    env = os.environ if env is None else env
+    if setup is None:
+        setup = lambda name: curses.setupterm(term=name, fd=sys.__stdout__.fileno())
+    first = env.get("TERM", "")
+    for name in (first, *TERM_FALLBACKS):
+        if not name:
+            continue
+        try:
+            setup(name)
+        except curses.error:
+            continue
+        env["TERM"] = name
+        return name
+    return None
 
 
 def main(stdscr: curses.window, app: App) -> None:
@@ -3959,7 +4024,7 @@ def main(stdscr: curses.window, app: App) -> None:
             if pending:
                 draw(stdscr, app)
                 pending = False
-            key = stdscr.getch()
+            key = read_key(stdscr)
             if key == -1:
                 if busy:
                     app.step_graph()
@@ -4054,6 +4119,9 @@ def run(argv: list[str] | None = None) -> None:
         cfg = load_config()
         plugins = load_plugins()
         root, open_file = resolve_launch(args, cfg, Path.cwd())
+        if os.name != "nt" and pick_term() is None:
+            print(f"grimoire: no terminal entry for TERM={os.environ.get('TERM', '')}. Try TERM=xterm-256color", file=sys.stderr)
+            raise SystemExit(1)
         app = App(root, open_file, name=cfg["name"])
         app.plugins = plugins
         if open_file is not None:
