@@ -26,8 +26,9 @@ if (!python) {
   process.exit(127);
 }
 
-// The reader owns ctrl+c and ctrl+z while it runs. Node only waits.
-for (const name of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"]) process.on(name, () => {});
+// The reader owns ctrl+c and ctrl+z (undo) while it runs. Node only waits.
+// Without a SIGTSTP handler the shell would stop Node and leave the reader running.
+for (const name of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP"]) process.on(name, () => {});
 
 const result = spawnSync(python, [script, ...process.argv.slice(2)], { stdio: "inherit" });
 if (result.error) {

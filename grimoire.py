@@ -3955,7 +3955,7 @@ def run(argv: list[str] | None = None) -> None:
     if args and args[0] in ("help", "--help", "-h"):
         print(USAGE, end="")
         return
-    if args and args[0] in ("version", "--version", "-V"):
+    if args and args[0] in ("--version", "-V"):
         print(f"grimoire {__version__}")
         return
     if args and args[0] == "plugins":
