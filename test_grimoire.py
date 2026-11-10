@@ -835,6 +835,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(page.stat().st_mode & 0o777, 0o600)
         self.assertEqual(page.read_text(), "y\n")
 
+    @unittest.skipIf(os.name == "nt", "Windows has no permission bits")
     def test_new_page_follows_umask(self):
         old = os.umask(0o022)
         try:
