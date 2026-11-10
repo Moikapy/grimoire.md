@@ -1396,6 +1396,52 @@ class HardeningTests(unittest.TestCase):
                 else:
                     os.environ["GRIMOIRE_KEYS"] = old
 
+    def test_drag_text_reads_like_a_terminal_selection(self):
+        screen = {
+            0: "  Title                 ",
+            1: "  first line of text    ",
+            2: "                        ",
+            3: "  second line           ",
+            4: "status bar              ",
+        }
+        self.assertEqual(grimoire.drag_text(screen, (1, 8), (1, 11), 24), "line")
+        self.assertEqual(grimoire.drag_text(screen, (1, 11), (1, 8), 24), "line")
+        self.assertEqual(grimoire.drag_text(screen, (1, 8), (3, 7), 24), "line of text\n\nsecond")
+        self.assertEqual(grimoire.drag_text(screen, (0, 0), (3, 23), 24), "Title\nfirst line of text\n\nsecond line")
+        self.assertEqual(grimoire.drag_text(screen, (2, 0), (2, 5), 24), "")
+        self.assertEqual(grimoire.drag_rows((3, 7), (1, 8), 24), [(1, 8, 23), (2, 0, 23), (3, 0, 7)])
+
+    def test_mouse_drag_selects_and_a_click_does_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "note.md"
+            page.write_text("# T\none\ntwo\n", encoding="utf-8")
+            old = os.environ.get("GRIMOIRE_KEYS")
+            os.environ["GRIMOIRE_KEYS"] = str(root / "nokeys.json")
+            try:
+                app = App(root, page, name="x")
+                app.mouse((0, 4, 1, 0, curses.BUTTON1_PRESSED))
+                self.assertTrue(app.dragging)
+                app.mouse((0, 9, 2, 0, curses.REPORT_MOUSE_POSITION))
+                self.assertEqual(app.drag, ((1, 4), (2, 9)))
+                self.assertFalse(app.drag_copy)
+                app.mouse((0, 10, 2, 0, curses.BUTTON1_RELEASED))
+                self.assertEqual(app.drag, ((1, 4), (2, 10)))
+                self.assertTrue(app.drag_copy)
+                self.assertFalse(app.dragging)
+                app.drag_copy = False
+                app.handle(ord("j"))  # any key drops the highlight
+                self.assertIsNone(app.drag)
+                app.mouse((0, 4, 1, 0, curses.BUTTON1_PRESSED))
+                app.mouse((0, 4, 1, 0, curses.BUTTON1_RELEASED))
+                self.assertIsNone(app.drag)
+                self.assertFalse(app.drag_copy)
+            finally:
+                if old is None:
+                    os.environ.pop("GRIMOIRE_KEYS", None)
+                else:
+                    os.environ["GRIMOIRE_KEYS"] = old
+
     def test_image_opener_per_platform(self):
         have = {"imv": "/usr/bin/imv", "xdg-open": "/usr/bin/xdg-open", "open": "/usr/bin/open"}
         only_open = lambda name: have.get(name) if name == "open" else None

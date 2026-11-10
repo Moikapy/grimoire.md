@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 try:
     import curses
@@ -1493,6 +1493,39 @@ WHEEL_UP = curses.BUTTON4_PRESSED
 WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0x200000)  # older curses builds do not name it
 WHEEL_LINES = 3
 
+DRAG_ON = "\x1b[?1002h"  # ask the terminal to report the pointer while a button is held
+DRAG_OFF = "\x1b[?1002l"
+
+
+def drag_rows(a: tuple[int, int], b: tuple[int, int], width: int) -> list[tuple[int, int, int]]:
+    """A drag from one screen cell to another, as (row, first column, last column).
+
+    It runs like a terminal's own selection: the rest of the first row, whole rows
+    between, and the last row up to the pointer.
+    """
+    (y0, x0), (y1, x1) = sorted((a, b))
+    last = max(0, width - 1)
+    if y0 == y1:
+        return [(y0, x0, x1)]
+    return [(y0, x0, last), *[(y, 0, last) for y in range(y0 + 1, y1)], (y1, 0, x1)]
+
+
+def drag_text(screen: dict[int, str], a: tuple[int, int], b: tuple[int, int], width: int) -> str:
+    """The text a drag covers. Row ends lose their padding, whole rows lose the left margin."""
+    picked: list[tuple[str, bool]] = []
+    for y, first, last in drag_rows(a, b, width):
+        row = screen.get(y, "")
+        picked.append((row[first : last + 1].rstrip(), first == 0))
+    margins = [len(text) - len(text.lstrip(" ")) for text, whole in picked if whole and text]
+    margin = min(margins) if margins else 0
+    lines = [text[margin:] if whole and text else text for text, whole in picked]
+    while lines and not lines[-1]:
+        lines.pop()
+    while lines and not lines[0]:
+        lines.pop(0)
+    return "\n".join(lines)
+
+
 OSC52_MAX = 100_000  # terminals drop a longer clipboard sequence
 
 
@@ -1894,6 +1927,9 @@ class App:
         self.graph_return = False
         self.trail: list[tuple[Path, int, int]] = []  # pages a followed link was opened from
         self.sel_from: int | None = None  # the line a selection started on
+        self.drag: tuple[tuple[int, int], tuple[int, int]] | None = None  # screen cells (row, column)
+        self.dragging = False
+        self.drag_copy = False  # the button was let go: draw() reads the screen and copies
         self.glast: tuple[int, int] = (80, 24)
         self.gshown: dict | None = None
         if open_file is not None:
@@ -2321,6 +2357,8 @@ class App:
             return False
         if key == curses.KEY_MOUSE:
             return self.mouse()
+        self.drag = None
+        self.dragging = False
         if self.mode == "help":
             if self.keys.pressed("help", "close", key):
                 self.mode = self.help_from
@@ -2862,6 +2900,23 @@ class App:
         _, x, y, _, bstate = event
         if self.mode == "graph":
             return self.graph_mouse(x, y, bstate)
+        if bstate & curses.BUTTON1_PRESSED:
+            self.drag = ((y, x), (y, x))
+            self.dragging = True
+            self.drag_copy = False
+            return True
+        if self.dragging and self.drag is not None:
+            self.drag = (self.drag[0], (y, x))
+            if bstate & curses.BUTTON1_RELEASED:
+                self.dragging = False
+                if self.drag[0] == self.drag[1]:
+                    self.drag = None  # a click, not a drag
+                else:
+                    self.drag_copy = True
+            return True
+        if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED):
+            self.drag = None
+            return True
         step = -1 if bstate & WHEEL_UP else 1 if bstate & WHEEL_DOWN else 0
         if not step:
             return True
@@ -3679,12 +3734,43 @@ def paint_bar(stdscr: curses.window, app: App, rows: int, cols: int) -> None:
     put(stdscr, rows - 1, 0, text, style_attr(FOOTER), cols, rows)
 
 
+def screen_rows(stdscr: curses.window, wanted: list[int]) -> dict[int, str]:
+    found: dict[int, str] = {}
+    for y in wanted:
+        try:
+            found[y] = stdscr.instr(y, 0).decode("utf-8", "replace")
+        except curses.error:
+            continue
+    return found
+
+
 def draw(stdscr: curses.window, app: App) -> None:
-    stdscr.erase()
     rows, cols = stdscr.getmaxyx()
+    if app.drag is not None and app.drag_copy:
+        # The screen still holds what the pointer was dragged over. Read it before it is redrawn.
+        app.drag_copy = False
+        spans = drag_rows(app.drag[0], app.drag[1], cols)
+        text = drag_text(screen_rows(stdscr, [y for y, _, _ in spans]), app.drag[0], app.drag[1], cols)
+        if text:
+            count = text.count("\n") + 1
+            app.copy(text, "the selection" if count == 1 else f"{count} lines")
+        else:
+            app.drag = None
+    stdscr.erase()
+    draw_frame(stdscr, app, rows, cols)
+    if app.drag is not None:
+        for y, first, last in drag_rows(app.drag[0], app.drag[1], cols):
+            if 0 <= y < rows:
+                try:
+                    stdscr.chgat(y, first, max(1, min(last, cols - 1) - first + 1), curses.A_REVERSE)
+                except curses.error:
+                    pass
+    stdscr.refresh()
+
+
+def draw_frame(stdscr: curses.window, app: App, rows: int, cols: int) -> None:
     if rows < 8 or cols < 30:
         put(stdscr, 0, 0, "terminal too small", style_attr(FOOTER), cols, rows)
-        stdscr.refresh()
         return
     if app.mode in ("list", "name", "filter"):
         draw_list(stdscr, app, rows, cols)
@@ -3696,7 +3782,6 @@ def draw(stdscr: curses.window, app: App) -> None:
         app.help_at = draw_help(stdscr, rows, cols, help_lines(app.name, app.keys), app.help_at)
     else:
         paint_bar(stdscr, app, rows, cols)
-    stdscr.refresh()
 
 
 def banner(text: str) -> list[str] | None:
@@ -4299,9 +4384,12 @@ def main(stdscr: curses.window, app: App) -> None:
     init_colors()
     stdscr.keypad(True)
     pending = True
+    dragging = False
     try:
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+            curses.mouseinterval(0)  # a press and a release arrive as they happen, not as one late click
+            dragging = report_drag(True)
         except curses.error:
             pass
         while True:
@@ -4323,6 +4411,21 @@ def main(stdscr: curses.window, app: App) -> None:
             pending = True
     except KeyboardInterrupt:
         return
+    finally:
+        if dragging:
+            report_drag(False)
+
+
+def report_drag(on: bool) -> bool:
+    """curses asks for clicks only. This asks for the pointer's position while a button is down."""
+    if os.name == "nt":
+        return False
+    try:
+        sys.__stdout__.write(DRAG_ON if on else DRAG_OFF)
+        sys.__stdout__.flush()
+    except (OSError, ValueError, AttributeError):
+        return False
+    return True
 
 
 def utf8_pipes() -> None:

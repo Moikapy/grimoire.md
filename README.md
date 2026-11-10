@@ -109,7 +109,9 @@ In a page, `y` copies the line you are on. `V` starts a selection: move up or do
 
 The text goes to the system clipboard through `wl-copy`, `xclip` or `xsel`, `pbcopy`, or `clip`, whichever the machine has. Inside tmux it also becomes a tmux buffer. Over ssh, or with none of those tools, Grimoire asks the terminal itself to take the text (OSC 52), so it lands on the machine you are sitting at; most current terminals allow that, and it tops out near 75 KB.
 
-To select with the mouse the way the terminal normally does, hold shift while you drag.
+Or use the mouse: press, drag, and let go. The text you dragged over is highlighted and copied the moment you release, the way a terminal's own selection reads: the rest of the first row, whole rows between, the last row up to the pointer. It copies what is on screen, so a rendered line comes out without its `**` and `#` marks, and it cannot reach past the edge of the window; use `V` for a longer stretch. Any key drops the highlight. This works in every view.
+
+To use the terminal's own selection instead, hold shift while you drag.
 
 ## tmux, Herdr, ssh
 
