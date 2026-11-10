@@ -99,6 +99,14 @@ In a markdown page, enter (or `o`) on a line with a link opens the page it names
 
 Esc goes back to the page and the line you came from. Follow three links and Esc unwinds all three, then returns to the graph or the shelf you started from. A page with unsaved edits asks you to save before it lets you leave through a link. A link to a page that does not exist says so in the footer. Web addresses are not opened.
 
+## Copy
+
+In a page, `y` copies the line you are on. `V` starts a selection: move up or down, and `y` copies those lines (Esc drops the selection). `Y` copies the whole page. In a `.csv` or `.tsv` grid, `y` copies the cell. Copying never changes the file. The keys are `copy`, `select`, and `copy_page` in `keys.json`.
+
+The text goes to the system clipboard through `wl-copy`, `xclip` or `xsel`, `pbcopy`, or `clip`, whichever the machine has. Inside tmux it also becomes a tmux buffer. Over ssh, or with none of those tools, Grimoire asks the terminal itself to take the text (OSC 52), so it lands on the machine you are sitting at; most current terminals allow that, and it tops out near 75 KB.
+
+To select with the mouse the way the terminal normally does, hold shift while you drag.
+
 ## tmux, Herdr, ssh
 
 Grimoire runs inside a multiplexer or over ssh with nothing to set up. Text you type can be any script, not only ASCII.

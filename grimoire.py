@@ -14,6 +14,7 @@ The display name is lore. The command and the config keys stay plain.
 
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import importlib.util
@@ -32,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 try:
     import curses
@@ -401,6 +402,9 @@ DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
         "undo": ["ctrl+z"],
         "redo": ["ctrl+y"],
         "graph": ["ctrl+g"],
+        "copy": ["y"],
+        "copy_page": ["Y"],
+        "select": ["V"],
     },
     "graph": {
         "quit": ["ctrl+q"],
@@ -1485,6 +1489,77 @@ def image_caption(alt: str, dest: str, *, missing: bool = False) -> str:
     return label + ("  (missing)" if missing else "")
 
 
+OSC52_MAX = 100_000  # terminals drop a longer clipboard sequence
+
+
+def clipboard_tool(which=shutil.which, platform: str | None = None, env=None) -> list[str] | None:
+    """The command that takes text on stdin and puts it on the clipboard.
+
+    Over ssh a desktop tool would fill the far machine's clipboard, so it is skipped:
+    tmux or the terminal itself carries the text back to where the person is.
+    """
+    platform = platform or sys.platform
+    env = os.environ if env is None else env
+    # tmux keeps the text as a buffer and passes it on to the terminal outside (-w).
+    tmux = ["tmux", "load-buffer", "-w", "-"] if env.get("TMUX") and which("tmux") else None
+    if env.get("SSH_CONNECTION") or env.get("SSH_TTY"):
+        return tmux
+    return _desktop_clipboard(which, platform, env) or tmux
+
+
+def _desktop_clipboard(which, platform: str, env) -> list[str] | None:
+    if platform == "darwin":
+        return ["pbcopy"] if which("pbcopy") else None
+    if platform == "win32":
+        return ["clip"] if which("clip") else None
+    if env.get("WAYLAND_DISPLAY") and which("wl-copy"):
+        return ["wl-copy"]
+    if env.get("DISPLAY"):
+        if which("xclip"):
+            return ["xclip", "-selection", "clipboard"]
+        if which("xsel"):
+            return ["xsel", "--clipboard", "--input"]
+    if which("clip.exe"):  # WSL
+        return ["clip.exe"]
+    return None
+
+
+def osc52(text: str) -> str | None:
+    """The escape sequence that asks the terminal to take the text. None when it is too long."""
+    body = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    if len(body) > OSC52_MAX:
+        return None
+    return f"\x1b]52;c;{body}\x07"
+
+
+def copy_text(text: str, tool: list[str] | None | bool = False, write=None, run=None) -> str:
+    """Put text on the clipboard. Returns how, or "" when nothing worked."""
+    if tool is False:
+        tool = clipboard_tool()
+    if tool:
+        data = text.encode("utf-16") if tool[0] in ("clip", "clip.exe") else text.encode("utf-8")
+        try:
+            done = (run or subprocess.run)(
+                tool, input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=False
+            )
+            if done.returncode == 0:
+                return tool[0]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    sequence = osc52(text)
+    if sequence is None:
+        return ""
+    try:
+        if write is not None:
+            write(sequence)
+        else:
+            sys.__stdout__.write(sequence)
+            sys.__stdout__.flush()
+    except (OSError, ValueError):
+        return ""
+    return "terminal"
+
+
 STARTFILE = "startfile"  # Windows opens a file with whatever is registered for it
 
 
@@ -1578,8 +1653,12 @@ def doc_layout(
     renderer=None,
     note: Path | None = None,
     preview=None,
+    selection: tuple[int, int] | None = None,
 ) -> list[tuple[int, int, list[tuple[str, str]]]]:
-    """Screen rows. Wrapped lines take more than one row. The cursor row starts at the top, then stays centered."""
+    """Screen rows. Wrapped lines take more than one row. The cursor row starts at the top, then stays centered.
+
+    selection is a first and last line. Those lines are drawn selected, apart from the cursor line.
+    """
     if height < 1 or not lines:
         return []
     row = max(0, min(row, len(lines) - 1))
@@ -1587,7 +1666,9 @@ def doc_layout(
     inner = max(1, width - margin)
     visuals: list[list[tuple[str, str]]] = []
     cursor_at = 0
+    starts: list[int] = []
     for index, raw in enumerate(lines):
+        starts.append(len(visuals))
         if index == row:
             pieces = wrap_ranges(raw, inner)
             cursor_at = len(visuals)
@@ -1629,6 +1710,13 @@ def doc_layout(
         visuals.extend(wrap_spans(rendered, inner))
     if not visuals:
         return []
+    if selection is not None:
+        starts.append(len(visuals))
+        for index in range(max(0, selection[0]), min(len(lines) - 1, selection[1]) + 1):
+            if index == row:
+                continue
+            for at in range(starts[index], starts[index + 1]):
+                visuals[at] = [(text, SELECTED) for text, _ in visuals[at]] or [(" ", SELECTED)]
     cursor_at = max(0, min(cursor_at, len(visuals) - 1))
     focus_y = focus_anchor(cursor_at, len(visuals), height)
     first = cursor_at - focus_y
@@ -1700,6 +1788,8 @@ def help_lines(name: str, keys: KeyMap | None = None) -> tuple[str, ...]:
         f"  {bound.show('normal', 'left')} {bound.show('normal', 'down')} {bound.show('normal', 'up')} {bound.show('normal', 'right')}   move",
         f"  {bound.show('normal', 'insert')}   insert at the cursor",
         f"  {bound.show('normal', 'view')}   follow the link on this line, or view its image",
+        f"  {bound.show('normal', 'copy')}   copy the line (the cell in a table); {bound.show('normal', 'copy_page')} copies the page",
+        f"  {bound.show('normal', 'select')}   select lines: move, then {bound.show('normal', 'copy')} copies them",
         f"  {bound.show('normal', 'append')}   append, then type",
         f"  {bound.show('normal', 'record')}   .csv/.tsv: grid or one record at a time",
         f"  {bound.show('normal', 'view')}   .csv/.tsv: edit the cell; {bound.show('normal', 'insert')} edits the raw line",
@@ -1799,6 +1889,7 @@ class App:
         self.graph_from = "list"
         self.graph_return = False
         self.trail: list[tuple[Path, int, int]] = []  # pages a followed link was opened from
+        self.sel_from: int | None = None  # the line a selection started on
         self.glast: tuple[int, int] = (80, 24)
         self.gshown: dict | None = None
         if open_file is not None:
@@ -1844,6 +1935,7 @@ class App:
 
     def open_path(self, path: Path) -> None:
         self.lines, self.note = read_lines(path)
+        self.sel_from = None
         self.truncated = bool(self.note)
         self.newline, self.final_newline = line_style(path)
         self.fences = fence_flags(self.lines)
@@ -2074,6 +2166,40 @@ class App:
         self.row = min(row, len(self.lines) - 1)
         self.message = "reloaded"
 
+    def selection(self) -> tuple[int, int] | None:
+        if self.sel_from is None:
+            return None
+        return min(self.sel_from, self.row), max(self.sel_from, self.row)
+
+    def copy(self, text: str, what: str) -> None:
+        how = copy_text(text)
+        if not how:
+            self.message = "could not copy: no clipboard tool, and too long for the terminal"
+        elif how == "terminal":
+            self.message = f"copied {what} (through the terminal)"
+        else:
+            self.message = f"copied {what}"
+
+    def copy_here(self) -> None:
+        """The selection if there is one. Otherwise the cell in a table, or the line."""
+        picked = self.selection()
+        if picked is not None:
+            first, last = picked
+            self.sel_from = None
+            count = last - first + 1
+            self.copy("\n".join(self.lines[first : last + 1]) + "\n", "1 line" if count == 1 else f"{count} lines")
+            return
+        table = self.table() if self.table_view() else None
+        if table is not None:
+            self.copy(table.cell(self.row, self.tcol), "the cell")
+            return
+        self.copy(self.lines[self.row], "the line")
+
+    def copy_page(self) -> None:
+        self.sel_from = None
+        what = f"the first {len(self.lines)} lines" if self.truncated else "the page"
+        self.copy("\n".join(self.lines) + "\n", what)
+
     def follow_link(self) -> bool:
         """Open the page the link on this line names. step_back returns here."""
         if self.path is None:
@@ -2248,6 +2374,7 @@ class App:
         return True
 
     def begin_insert(self, *, append: bool) -> None:
+        self.sel_from = None
         if self.truncated:
             self.message = READ_ONLY
             return
@@ -2360,6 +2487,20 @@ class App:
     def handle_normal(self, key: int | str) -> bool:
         leaving = self.keys.pressed("normal", "leave", key)
         quitting = self.keys.pressed("normal", "quit", key)
+        if self.keys.pressed("normal", "copy", key):
+            self.copy_here()
+            return True
+        if self.keys.pressed("normal", "copy_page", key):
+            self.copy_page()
+            return True
+        if self.keys.pressed("normal", "select", key) and not self.table_view():
+            self.sel_from = None if self.sel_from is not None else self.row
+            self.message = "" if self.sel_from is None else "selecting: move, then copy"
+            return True
+        if self.sel_from is not None and leaving:
+            self.sel_from = None
+            self.message = ""
+            return True
         if leaving or quitting:
             if self.dirty:
                 self.mode = "confirm"
@@ -3652,6 +3793,7 @@ def draw_read(stdscr: curses.window, app: App, rows: int, cols: int) -> None:
             fences=app.fences,
             renderer=app.renderer,
             note=app.path,
+            selection=app.selection(),
         )
     paint_spans(stdscr, painted, 0, cols, rows)
     if app.backlinks:

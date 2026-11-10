@@ -1277,6 +1277,85 @@ class HardeningTests(unittest.TestCase):
                     else:
                         os.environ[name] = value
 
+    def test_clipboard_tool_per_platform(self):
+        have = lambda *names: (lambda name: f"/bin/{name}" if name in names else None)
+        tool = grimoire.clipboard_tool
+        self.assertEqual(tool(have("pbcopy"), "darwin", {}), ["pbcopy"])
+        self.assertEqual(tool(have("clip"), "win32", {}), ["clip"])
+        self.assertEqual(tool(have("wl-copy", "xclip"), "linux", {"WAYLAND_DISPLAY": "w", "DISPLAY": ":0"}), ["wl-copy"])
+        self.assertEqual(tool(have("xclip"), "linux", {"DISPLAY": ":0"}), ["xclip", "-selection", "clipboard"])
+        self.assertIsNone(tool(have("wl-copy"), "linux", {}))
+        self.assertIsNone(tool(have("wl-copy"), "linux", {"WAYLAND_DISPLAY": "w", "SSH_CONNECTION": "1 2 3 4"}))
+        inside = ["tmux", "load-buffer", "-w", "-"]
+        self.assertEqual(tool(have("wl-copy", "tmux"), "linux", {"WAYLAND_DISPLAY": "w", "SSH_TTY": "/dev/pts/1", "TMUX": "x"}), inside)
+        self.assertEqual(tool(have("tmux"), "linux", {"TMUX": "x"}), inside)
+        self.assertEqual(tool(have("wl-copy", "tmux"), "linux", {"WAYLAND_DISPLAY": "w", "TMUX": "x"}), ["wl-copy"])
+
+    def test_copy_text_uses_the_tool_then_the_terminal(self):
+        import base64
+        import subprocess
+
+        calls = []
+
+        def ok(argv, **kw):
+            calls.append((argv, kw["input"]))
+            return subprocess.CompletedProcess(argv, 0)
+
+        def broken(argv, **kw):
+            raise OSError("gone")
+
+        wrote = []
+        self.assertEqual(grimoire.copy_text("hé", ["wl-copy"], wrote.append, ok), "wl-copy")
+        self.assertEqual(calls, [(["wl-copy"], "hé".encode("utf-8"))])
+        self.assertEqual(wrote, [])
+        self.assertEqual(grimoire.copy_text("hé", ["wl-copy"], wrote.append, broken), "terminal")
+        self.assertEqual(grimoire.copy_text("hé", None, wrote.append), "terminal")
+        self.assertEqual(wrote[-1], "\x1b]52;c;" + base64.b64encode("hé".encode("utf-8")).decode() + "\x07")
+        self.assertEqual(grimoire.copy_text("x" * grimoire.OSC52_MAX, None, wrote.append), "")
+
+    def test_copy_line_selection_and_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "note.md"
+            page.write_text("# T\none\ntwo\nthree\n", encoding="utf-8")
+            old = os.environ.get("GRIMOIRE_KEYS")
+            os.environ["GRIMOIRE_KEYS"] = str(root / "nokeys.json")
+            copied = []
+            real = grimoire.copy_text
+            grimoire.copy_text = lambda text: copied.append(text) or "wl-copy"
+            try:
+                app = App(root, page, name="x")
+                app.row = 1
+                app.handle(ord("y"))
+                self.assertEqual(copied[-1], "one")
+                self.assertEqual(app.message, "copied the line")
+                app.handle(ord("V"))
+                app.handle(ord("j"))
+                app.handle(ord("j"))
+                self.assertEqual(app.selection(), (1, 3))
+                painted = doc_layout(app.lines, app.row, 0, height=8, width=40, markdown=True, selection=app.selection())
+                styles = {"".join(t for t, _ in spans): {st for _, st in spans} for _, _, spans in painted}
+                self.assertEqual(styles["one"], {grimoire.SELECTED})
+                self.assertEqual(styles["two"], {grimoire.SELECTED})
+                self.assertNotIn(grimoire.SELECTED, styles["T"])
+                app.handle(ord("y"))
+                self.assertEqual(copied[-1], "one\ntwo\nthree\n")
+                self.assertEqual(app.message, "copied 3 lines")
+                self.assertIsNone(app.selection())
+                app.handle(ord("V"))
+                app.handle(27)  # esc ends the selection, it does not leave the page
+                self.assertIsNone(app.selection())
+                self.assertEqual(app.mode, "read")
+                app.handle(ord("Y"))
+                self.assertEqual(copied[-1], "# T\none\ntwo\nthree\n")
+                self.assertEqual(page.read_text(encoding="utf-8"), "# T\none\ntwo\nthree\n")
+            finally:
+                grimoire.copy_text = real
+                if old is None:
+                    os.environ.pop("GRIMOIRE_KEYS", None)
+                else:
+                    os.environ["GRIMOIRE_KEYS"] = old
+
     def test_image_opener_per_platform(self):
         have = {"imv": "/usr/bin/imv", "xdg-open": "/usr/bin/xdg-open", "open": "/usr/bin/open"}
         only_open = lambda name: have.get(name) if name == "open" else None
