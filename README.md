@@ -6,15 +6,21 @@ The name is the lore. Phylactery is already Lich's session files, and Ossuary is
 
 ## Install
 
-Needs Python 3.10 or newer on Linux or macOS. Nothing else: curses is in the standard library.
+Runs on Linux, macOS, and Windows. Needs Python 3.10 or newer and nothing else (Windows also pulls in `windows-curses`, automatically).
+
+Straight from GitHub, no registry needed. [uv](https://docs.astral.sh/uv/) brings its own Python:
 
 ```sh
-pipx install grimoire-md      # or: uv tool install grimoire-md
-npm install -g grimoire-md    # same program, started by a small Node shim
+uv tool install git+https://github.com/Moikapy/grimoire.md
 grimoire --help
+uv tool upgrade grimoire-md   # later, to update
 ```
 
-The npm package still runs on your Python. Set `GRIMOIRE_PYTHON` if the right one is not `python3`.
+`pipx install git+https://github.com/Moikapy/grimoire.md` does the same with the Python you already have. While the repo is private, sign git in first (`gh auth login`).
+
+With npm instead: `npm install -g github:Moikapy/grimoire.md`. That is a small Node shim that still runs on your Python. Set `GRIMOIRE_PYTHON` if the right one is not `python3`, and on Windows run `pip install windows-curses` yourself.
+
+On Android, Termux counts as Linux. On a phone or tablet without a terminal, ssh to a machine that has it.
 
 From a clone:
 
@@ -23,8 +29,6 @@ git clone https://github.com/Moikapy/grimoire.md grimoire
 cd grimoire
 ln -sfn "$(pwd)/grimoire.py" ~/.local/bin/grimoire
 ```
-
-No install step copies config. Each person gets their own `~/.grimoire/config.json` the first time they run `grimoire setup`. Plugins stay in `~/.grimoire/plugins` and are not part of the clone.
 
 ## Use
 
@@ -87,12 +91,15 @@ grimoire images
 | tool | if it is installed | if it is not |
 | --- | --- | --- |
 | `chafa` | a small text preview in the reader | the alt text and the path |
-| `imv` | enter or o opens the file | `xdg-open` is the backup |
-| neither opener | | the footer says `install imv to view images` |
+| `imv` | enter or o opens the file | `xdg-open` on Linux, `open` on macOS, the default app on Windows |
+| no opener | | the footer says `install imv to view images` |
 
 ```sh
 # Arch
 sudo pacman -S chafa imv
+
+# macOS
+brew install chafa
 ```
 
 `chafa` is only used as symbols, so the preview is text and works in Ghostty, foot, Alacritty, Herdr, or ssh. It does not send Kitty or sixel sequences. The real picture is the viewer.
