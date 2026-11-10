@@ -3853,14 +3853,22 @@ def show_read(args: list[str]) -> None:
     if not args:
         print("grimoire: read needs a page", file=sys.stderr)
         raise SystemExit(1)
-    print(read_page(args[0]), end="")
+    try:
+        print(read_page(args[0]), end="")
+    except (FileNotFoundError, ValueError):
+        print(f"grimoire: no page {args[0]}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def show_write(args: list[str]) -> None:
     if not args:
         print("grimoire: write needs a page", file=sys.stderr)
         raise SystemExit(1)
-    print(json.dumps(write_page(args[0], sys.stdin.read())))
+    try:
+        print(json.dumps(write_page(args[0], sys.stdin.read())))
+    except ValueError:
+        print(f"grimoire: bad page name {args[0]}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def show_search(args: list[str]) -> None:
