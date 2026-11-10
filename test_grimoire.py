@@ -417,13 +417,13 @@ class ParseTests(unittest.TestCase):
             shelf.mkdir()
             cfg = {"name": "GRIMOIRE", "open": "cwd", "library": str(shelf)}
             root, opened = resolve_launch([], cfg, cwd)
-            self.assertEqual(root, shelf.resolve())
+            self.assertEqual(root.resolve(), shelf.resolve())
             self.assertIsNone(opened)
             for flag in ("-c", "--current", "-l", "--local"):
                 root, opened = resolve_launch([flag], cfg, cwd)
                 self.assertEqual(root, cwd.resolve())
             root, opened = resolve_launch(["library"], cfg, cwd)
-            self.assertEqual(root, shelf.resolve())
+            self.assertEqual(root.resolve(), shelf.resolve())
 
     def test_setup_writes_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -610,7 +610,7 @@ class ParseTests(unittest.TestCase):
             library = Path(tmp)
             cfg = {"name": "GRIMOIRE", "open": "library", "library": str(library)}
             saved = grimoire.write_page("note", "# Note\n\nSee the word wrap.\n", cfg)
-            self.assertTrue(saved["path"].startswith(str(library)))
+            self.assertTrue(saved["path"].startswith(str(library.resolve())))
             hits = grimoire.search_pages("wrap", cfg)
             self.assertEqual(hits[0]["slug"], "note")
             with self.assertRaises(ValueError):
