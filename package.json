@@ -1,0 +1,38 @@
+{
+  "name": "grimoire-md",
+  "version": "0.1.0",
+  "description": "Terminal reader for markdown notes and scripts, with a page graph and an MCP server. Needs Python 3.10 or newer.",
+  "bin": {
+    "grimoire": "bin/grimoire.js"
+  },
+  "files": [
+    "bin/grimoire.js",
+    "grimoire.py",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "markdown",
+    "terminal",
+    "tui",
+    "notes",
+    "mcp"
+  ],
+  "license": "MIT",
+  "author": "moikapy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Moikapy/grimoire.md.git"
+  },
+  "homepage": "https://github.com/Moikapy/grimoire.md#readme",
+  "bugs": {
+    "url": "https://github.com/Moikapy/grimoire.md/issues"
+  }
+}

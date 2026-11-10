@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import os
 import sys
+import time
 import json
 from pathlib import Path
 
@@ -416,13 +417,13 @@ class ParseTests(unittest.TestCase):
             shelf.mkdir()
             cfg = {"name": "GRIMOIRE", "open": "cwd", "library": str(shelf)}
             root, opened = resolve_launch([], cfg, cwd)
-            self.assertEqual(root, shelf.resolve())
+            self.assertEqual(root.resolve(), shelf.resolve())
             self.assertIsNone(opened)
             for flag in ("-c", "--current", "-l", "--local"):
                 root, opened = resolve_launch([flag], cfg, cwd)
                 self.assertEqual(root, cwd.resolve())
             root, opened = resolve_launch(["library"], cfg, cwd)
-            self.assertEqual(root, shelf.resolve())
+            self.assertEqual(root.resolve(), shelf.resolve())
 
     def test_setup_writes_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -609,11 +610,199 @@ class ParseTests(unittest.TestCase):
             library = Path(tmp)
             cfg = {"name": "GRIMOIRE", "open": "library", "library": str(library)}
             saved = grimoire.write_page("note", "# Note\n\nSee the word wrap.\n", cfg)
-            self.assertTrue(saved["path"].startswith(str(library)))
+            self.assertTrue(saved["path"].startswith(str(library.resolve())))
             hits = grimoire.search_pages("wrap", cfg)
             self.assertEqual(hits[0]["slug"], "note")
             with self.assertRaises(ValueError):
                 grimoire.page_file("../outside", library)
+
+
+class GraphTests(unittest.TestCase):
+    def setUp(self):
+        old = grimoire.THEME_PAIRS.copy()
+        self.old_theme = old
+        grimoire.THEME_PAIRS.clear()
+
+    def tearDown(self):
+        grimoire.THEME_PAIRS.clear()
+        grimoire.THEME_PAIRS.update(self.old_theme)
+
+    @staticmethod
+    def pages(d: dict) -> dict:
+        base = {
+            "path": "",
+            "title": "",
+            "links": [],
+            "missing": [],
+            "backlinks": [],
+        }
+        return {slug: {**base, **spec} for slug, spec in d.items()}
+
+    def test_braille_bits_and_rows(self):
+        canvas = grimoire.canvas_new()
+        grimoire.canvas_plot(canvas, 0, 0)
+        grimoire.canvas_plot(canvas, 1, 0)
+        grimoire.canvas_plot(canvas, 0, 3)
+        grimoire.canvas_plot(canvas, 1, 3)
+        self.assertEqual(canvas[(0, 0)], 0x01 | 0x08 | 0x40 | 0x80)
+        self.assertEqual(grimoire.braille_char(0x01), "\u2801")
+        self.assertEqual(grimoire.braille_char(0x40), "\u2840")
+        self.assertEqual(grimoire.braille_char(0), "\u2800")
+        line = grimoire.canvas_new()
+        grimoire.canvas_line(line, 0, 0, 6, 0)
+        rows = grimoire.canvas_rows(line, 5, 1)
+        # a horizontal line fills the left and right dot of every cell
+        self.assertEqual(rows, ["\u2809\u2809\u2809\u2801"])
+
+    def test_layout_deterministic_and_linked_closer(self):
+        data = {
+            "pages": self.pages({
+                "a": {"links": ["b"], "backlinks": ["b"]},
+                "b": {"links": ["a"], "backlinks": ["a"]},
+                "c": {"links": [], "backlinks": []},
+            })
+        }
+
+        def run():
+            state = {
+                "pos": grimoire.seed_positions(["a", "b", "c"]),
+                "vel": {},
+                "edges": [("a", "b")],
+                "links": {},
+            }
+            state["vel"] = {slug: (0.0, 0.0) for slug in state["pos"]}
+            state["links"] = grimoire.link_map(state["edges"])
+            grimoire.settle_layout(state, max_steps=200)
+            return {slug: tuple(round(v, 6) for v in xy) for slug, xy in state["pos"].items()}
+
+        first, second = run(), run()
+        self.assertEqual(first, second)
+        linked = math_dist(first["a"], first["b"])
+        loose = math_dist(first["a"], first["c"])
+        self.assertLess(linked, loose)
+
+    def test_cone_pick_moves_to_the_right_node(self):
+        screen = {
+            "center": (10.0, 10.0),
+            "above": (11.0, 0.0),
+            "below": (9.0, 20.0),
+            "far_right": (60.0, 70.0),
+            "slant": (30.0, 4.0),
+        }
+        self.assertEqual(grimoire.cone_pick(screen, "center", (0, -1)), "above")
+        # the aligned near node beats a distant one in the same cone
+        self.assertEqual(grimoire.cone_pick(screen, "center", (1, 0)), "slant")
+        self.assertEqual(grimoire.cone_pick(screen, "center", (0, 1)), "below")
+        # no node in that direction: stay
+        self.assertEqual(grimoire.cone_pick({"solo": (5.0, 5.0)}, "solo", (0, -1)), "solo")
+
+    def test_label_placement(self):
+        items = [
+            ("sel", 0.0, 20.0, 40.0, 2.0, "Sel"),
+            ("one", 1.0, 40.0, 60.0, 1.5, "One"),
+            ("two", 2.0, 24.0, 39.0, 1.0, "Two"),
+            ("wide", 0.5, 2.0, 30.0, 1.0, "Very Long Label Here"),
+        ]
+        placed = grimoire.place_labels(items, 80, 20, {"sel", "one"})
+        rects = [(col - 1, row - 1, col + len(text) + 1, row + 1) for _, col, row, text in placed]
+        for i, a in enumerate(rects):
+            for b in rects[i + 1:]:
+                self.assertFalse(a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1])
+        got = {slug for slug, _, _, _ in placed}
+        self.assertIn("sel", got)
+        self.assertIn("one", got)
+
+    def test_flow_through_the_app(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            library = root / "pages"
+            library.mkdir()
+            (library / "index.md").write_text("# Index\n\nSee [[beta]].\n", encoding="utf-8")
+            (library / "beta.md").write_text("# Beta\n\nBack to [[index]].\n", encoding="utf-8")
+            cfg_path = root / "cfg.json"
+            cfg_path.write_text(json.dumps({"name": "GRIMOIRE", "open": "library", "library": str(library)}), encoding="utf-8")
+            os.environ["GRIMOIRE_CONFIG"] = str(cfg_path)
+            try:
+                app = App(root)
+                self.assertEqual(app.mode, "list")
+                app.handle(ord("g"))
+                self.assertEqual(app.mode, "graph")
+                self.assertEqual(app.gsel, "index")
+                self.assertTrue(app.handle(10))
+                self.assertEqual(app.mode, "read")
+                self.assertEqual(app.path.name, "index.md")
+                self.assertTrue(app.handle(27))
+                self.assertEqual(app.mode, "graph")
+                self.assertTrue(app.handle(27))
+                self.assertEqual(app.mode, "list")
+            finally:
+                os.environ.pop("GRIMOIRE_CONFIG", None)
+
+
+    def test_zoom_and_pan_transforms(self):
+        view = {"cx": 0.0, "cy": 0.0, "z": 10.0, "zfit": 10.0}
+        dx, dy = grimoire.project(0.5, -0.5, view, 40, 12)
+        self.assertEqual((dx, dy), (44.0, 17.0))
+        back = grimoire.unproject(dx, dy, view, 40, 12)
+        self.assertAlmostEqual(back[0], 0.5)
+        self.assertAlmostEqual(back[1], -0.5)
+        zoomed = grimoire.zoom_view(view, 2.0, 44.0, 17.0, 40, 12)
+        point = grimoire.project(0.5, -0.5, zoomed, 40, 12)
+        self.assertEqual(point, (44.0, 17.0))
+        panned = grimoire.pan_view(view, 10, 0, 40, 12)
+        self.assertAlmostEqual(panned["cx"], -1.0)
+        self.assertEqual(view, {"cx": 0.0, "cy": 0.0, "z": 10.0, "zfit": 10.0})
+
+    def test_local_missing_and_filter(self):
+        data = {
+            "pages": self.pages({
+                "a": {"title": "Alpha", "links": ["b", "ghost"], "missing": ["ghost"], "backlinks": []},
+                "b": {"title": "Beta", "links": ["a"], "backlinks": ["a"]},
+                "c": {"title": "Gamma", "links": ["b"], "backlinks": []},
+            })
+        }
+        nodes, edges = grimoire.graph_subset(data, "a", None, True, "")
+        self.assertEqual(set(nodes), {"a", "b", "c", grimoire.MISSING_MARK + "ghost"})
+        slim, _ = grimoire.graph_subset(data, "a", 1, True, "")
+        self.assertEqual(set(slim), {"a", "b", grimoire.MISSING_MARK + "ghost"})
+        nomiss, _ = grimoire.graph_subset(data, "a", None, False, "")
+        self.assertNotIn(grimoire.MISSING_MARK + "ghost", nomiss)
+        hit, edges_hit = grimoire.graph_subset(data, "a", None, True, "beta")
+        self.assertEqual(set(hit), {"b"})
+        self.assertEqual(edges_hit, [])
+
+    def test_app_local_and_missing_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            library = root / "pages"
+            library.mkdir()
+            (library / "index.md").write_text("# Index\n\nSee [[beta]] and [[void]].\n", encoding="utf-8")
+            (library / "beta.md").write_text("# Beta\n\nBack to [[index]].\n", encoding="utf-8")
+            cfg_path = root / "cfg.json"
+            cfg_path.write_text(json.dumps({"name": "GRIMOIRE", "open": "library", "library": str(library)}), encoding="utf-8")
+            os.environ["GRIMOIRE_CONFIG"] = str(cfg_path)
+            try:
+                app = App(root)
+                app.handle(ord("g"))
+                bar = grimoire.bar_spec(app)
+                self.assertFalse(any("depth" in part for part in bar[0]))
+                app.handle(ord("L"))
+                self.assertEqual(app.glocal, 1)
+                self.assertTrue(app.handle(ord("]")))
+                self.assertEqual(app.glocal, 2)
+                self.assertTrue(app.handle(ord("[")))
+                self.assertEqual(app.glocal, 1)
+                footer = grimoire.bar_spec(app)
+                self.assertIn("depth 1", " ".join(list(footer[0]) + list(footer[2:])))
+                self.assertTrue(app.handle(ord("m")))
+                self.assertFalse(app.gmissing)
+                self.assertNotIn(grimoire.MISSING_MARK + "void", app.gstate["shown"])
+            finally:
+                os.environ.pop("GRIMOIRE_CONFIG", None)
+
+
+def math_dist(a, b):
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
 
 class AgentTests(unittest.TestCase):
@@ -712,5 +901,234 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(replies[4]["result"]["isError"])
 
 
+class GraphKeyAndFlowTests(unittest.TestCase):
+    @staticmethod
+    def pages(d: dict) -> dict:
+        base = {"path": "", "title": "", "links": [], "missing": [], "backlinks": []}
+        return {slug: {key: (list(value) if isinstance(value, list) else value) for key, value in {**base, **spec}.items()} for slug, spec in d.items()}
+
+    @staticmethod
+    def make_app(tmp: str, body: str = "# One\nhello\n") -> tuple[App, str | None]:
+        root = Path(tmp)
+        library = root / "pages"
+        library.mkdir(exist_ok=True)
+        (library / "one.md").write_text(body, encoding="utf-8")
+        cfg = root / "config.json"
+        cfg.write_text(json.dumps({"library": str(library)}), encoding="utf-8")
+        old = os.environ.get("GRIMOIRE_CONFIG")
+        os.environ["GRIMOIRE_CONFIG"] = str(cfg)
+        app = App(root, library / "one.md")
+        return app, old
+
+    def test_no_key_is_bound_to_two_actions_in_one_mode(self):
+        for mode, actions in grimoire.DEFAULT_KEYS.items():
+            owner: dict[str, str] = {}
+            for action, names in actions.items():
+                for name in names:
+                    self.assertNotIn(name, owner, f"{mode}: {name} is on {owner.get(name)} and {action}")
+                    owner[name] = action
+
+    def test_normal_g_still_jumps_to_top(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, old = self.make_app(tmp, "# One\none\ntwo\nthree\n")
+            try:
+                app.row = len(app.lines) - 1
+                app.handle(ord("g"))
+                self.assertEqual(app.mode, "read")
+                self.assertEqual(app.row, 0)
+            finally:
+                self.restore_env(old)
+
+    def test_normal_ctrl_g_opens_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, old = self.make_app(tmp)
+            try:
+                app.handle(grimoire.parse_key("ctrl+g"))
+                self.assertEqual(app.mode, "graph")
+                self.assertEqual(app.graph_from, "read")
+            finally:
+                self.restore_env(old)
+
+    def restore_env(self, old):
+        if old is None:
+            os.environ.pop("GRIMOIRE_CONFIG", None)
+        else:
+            os.environ["GRIMOIRE_CONFIG"] = old
+
+    def test_esc_from_dirty_graph_page_returns_to_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, old = self.make_app(tmp)
+            try:
+                app.open_graph()
+                app.graph_open_selected()
+                self.assertEqual(app.mode, "read")
+                app.insert_text("x")
+                self.assertTrue(app.dirty)
+                app.handle(27)  # esc asks first
+                self.assertEqual(app.mode, "confirm")
+                app.handle(ord("d"))  # discard
+                self.assertEqual(app.mode, "graph")
+            finally:
+                self.restore_env(old)
+
+    def test_saved_graph_page_confirm_returns_to_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, old = self.make_app(tmp)
+            try:
+                app.open_graph()
+                app.graph_open_selected()
+                app.insert_text("x")
+                app.handle(27)
+                self.assertEqual(app.mode, "confirm")
+                app.handle(ord("s"))  # save
+                self.assertEqual(app.mode, "graph")
+            finally:
+                self.restore_env(old)
+
+    def test_settle_layout_honors_time_budget(self):
+        data = {"pages": self.pages({f"f{i%9}/p{i:04d}": {} for i in range(600)})}
+        data = self.connect(data)
+        nodes = grimoire.graph_nodes(data)
+        edges = grimoire.graph_links(data, nodes)
+        state = {
+            "pos": grimoire.seed_positions(sorted(nodes)),
+            "vel": {slug: (0.0, 0.0) for slug in nodes},
+            "edges": edges,
+            "links": grimoire.link_map(edges),
+        }
+        started = time.perf_counter()
+        grimoire.settle_layout(state, max_steps=5000, seconds=0.1)
+        elapsed = time.perf_counter() - started
+        self.assertTrue(state["settled"])
+        self.assertLess(elapsed, 2.0)
+
+    @classmethod
+    def connect(cls, data: dict) -> dict:
+        slugs = sorted(data["pages"])
+        for i, slug in enumerate(slugs[:-1]):
+            nxt = slugs[i + 1]
+            data["pages"][slug]["links"].append(nxt)
+            data["pages"][nxt]["backlinks"].append(slug)
+        return data
+
+    def test_settle_stops_when_the_graph_is_calm(self):
+        data = {"pages": self.pages({f"f{i%9}/p{i:04d}": {} for i in range(120)})}
+        data = self.connect(data)
+        nodes = grimoire.graph_nodes(data)
+        edges = grimoire.graph_links(data, nodes)
+        state = {
+            "pos": grimoire.seed_positions(sorted(nodes)),
+            "vel": {slug: (0.0, 0.0) for slug in nodes},
+            "edges": edges,
+            "links": grimoire.link_map(edges),
+        }
+        grimoire.settle_layout(state, max_steps=1500)
+        self.assertLessEqual(state["steps"], 1499)  # stopped on its own
+        per_node = state["moved"] / len(nodes)
+        self.assertLess(per_node, 0.003)
+
+    def test_place_cells_drops_off_screen_cells(self):
+        canvas: dict[tuple[int, int], int] = {}
+        grimoire.canvas_plot(canvas, -1, 0)   # left of the screen
+        grimoire.canvas_plot(canvas, 2, 0)    # on screen
+        runs = grimoire.place_cells(canvas, {}, [], 10)
+        self.assertEqual(runs, [(0, 1, "graph_edge", 1)])
+
+    def test_filter_with_no_matches_keeps_a_usable_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, old = self.make_app(tmp)
+            try:
+                app.open_graph()
+                app.handle(ord("/"))
+                app.gquery = "zzzz"
+                app.handle(grimoire.parse_key("enter"))
+                self.assertEqual(app.mode, "graph")
+                self.assertFalse(app.gstate["shown"])
+                self.assertEqual(app.message, "no pages match /zzzz")
+                app.handle(27)  # esc clears the filter
+                self.assertTrue(app.gstate["shown"])
+            finally:
+                self.restore_env(old)
+
+
+class HardeningTests(unittest.TestCase):
+    def test_truncated_file_is_read_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            big = root / "big.txt"
+            total = grimoire.MAX_LINES + 500
+            body = "".join(f"{n}\n" for n in range(total))
+            big.write_text(body, encoding="utf-8")
+            app = App(root, big, name="x")
+            self.assertEqual(len(app.lines), grimoire.MAX_LINES)
+            self.assertTrue(app.truncated)
+            app.begin_insert(append=False)
+            self.assertFalse(app.inserting)
+            self.assertEqual(app.message, grimoire.READ_ONLY)
+            self.assertFalse(app.save())
+            self.assertEqual(big.read_text(encoding="utf-8"), body)
+            small = root / "small.txt"
+            small.write_text("a\n", encoding="utf-8")
+            app.open_path(small)
+            self.assertFalse(app.truncated)
+            self.assertTrue(app.save())
+
+    def test_symlink_out_of_library_is_not_a_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            library = Path(tmp) / "lib"
+            outside = Path(tmp) / "out"
+            library.mkdir()
+            outside.mkdir()
+            (outside / "secret.md").write_text("# secret\n", encoding="utf-8")
+            (library / "home.md").write_text("# home\n", encoding="utf-8")
+            (library / "link.md").symlink_to(outside / "secret.md")
+            (library / "away").symlink_to(outside, target_is_directory=True)
+            self.assertEqual(list(grimoire.list_pages(library)), ["home"])
+            self.assertEqual(list(grimoire.build_graph(library)["pages"]), ["home"])
+
+    def test_open_image_refuses_a_file_that_is_not_an_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            note = Path(tmp) / "note.md"
+            script = Path(tmp) / "run.sh"
+            script.write_text("echo hi\n", encoding="utf-8")
+            seen = []
+            for raw in ("![x](run.sh)", f"![x]({script})"):
+                message = grimoire.open_image(
+                    note,
+                    raw,
+                    tools={"preview": None, "open": "/usr/bin/xdg-open"},
+                    spawn=lambda argv, **_kw: seen.append(argv),
+                )
+                self.assertEqual(message, "not an image")
+            self.assertEqual(seen, [])
+
+    def test_npm_and_python_versions_match(self):
+        package = json.loads((Path(grimoire.__file__).parent / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(package["version"], grimoire.__version__)
+
+    def test_absolute_image_path_is_not_previewed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            note = Path(tmp) / "notes" / "note.md"
+            note.parent.mkdir()
+            picture = Path(tmp) / "elsewhere.png"
+            picture.write_bytes(b"png")
+            seen = []
+            painted = doc_layout(
+                [f"![far]({picture})", "after"],
+                1,
+                0,
+                height=8,
+                width=200,
+                markdown=True,
+                note=note,
+                preview=lambda path, _width: seen.append(path) or ["@@@@"],
+            )
+            texts = ["".join(part for part, _ in spans) for _, _, spans in painted]
+            self.assertEqual(seen, [])
+            self.assertNotIn("@@@@", texts)
+            self.assertTrue(any(str(picture) in text and "(missing)" not in text for text in texts))
+
+
 if __name__ == "__main__":
     unittest.main()
+

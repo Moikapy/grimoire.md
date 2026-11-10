@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import csv
 import curses
+import hashlib
 import importlib.util
 import json
 import locale
+import math
 import os
 import re
 import shutil
@@ -27,9 +29,12 @@ import subprocess
 import sys
 import tempfile
 import termios
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+__version__ = "0.1.0"
 
 locale.setlocale(locale.LC_ALL, "")
 os.environ.setdefault("ESCDELAY", "25")
@@ -47,6 +52,7 @@ MARKDOWN_EXT = set(MD_SUFFIXES)
 REMOTE = ("http://", "https://", "mailto:")
 SKIP_DIRS = {"__pycache__", "node_modules", "dist", "build", ".venv", "venv"}
 MAX_LINES = 8000
+READ_ONLY = f"read-only: only the first {MAX_LINES} lines are loaded"
 CARD_W = 60
 
 # Styles the painter understands.
@@ -127,6 +133,16 @@ DEFAULT_THEME = {
     "link": "cyan",
     "folder": "magenta",
     "footer": "default",
+    "graph_edge": "default",
+    "graph_edge_hi": "cyan",
+    "graph_1": "yellow",
+    "graph_2": "cyan",
+    "graph_3": "green",
+    "graph_4": "magenta",
+    "graph_5": "red",
+    "graph_6": "blue",
+    "graph_7": "white",
+    "graph_8": "245",
 }
 THEME_PAIRS: dict[str, int] = {}
 
@@ -324,6 +340,7 @@ DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
         "new_folder": ["N"],
         "find": ["/"],
         "help": ["?", "f1"],
+        "graph": ["g"],
     },
     "normal": {
         "leave": ["esc"],
@@ -343,13 +360,41 @@ DEFAULT_KEYS: dict[str, dict[str, list[str]]] = {
         "save": ["f2", "ctrl+s"],
         "reload": ["f5"],
         "help": ["f1"],
-        "find": ["/", "ctrl+f"],
+        "find": ["/"],
         "find_next": ["ctrl+n"],
         "find_prev": ["ctrl+p"],
         "view": ["enter", "o"],
         "record": ["v"],
         "undo": ["ctrl+z"],
         "redo": ["ctrl+y"],
+        "graph": ["ctrl+g"],
+    },
+    "graph": {
+        "quit": ["ctrl+q"],
+        "leave": ["esc"],
+        "open": ["enter"],
+        "select_up": ["up", "k"],
+        "select_down": ["down", "j"],
+        "select_left": ["left", "h"],
+        "select_right": ["right", "l"],
+        "zoom_in": ["+", "="],
+        "zoom_out": ["-"],
+        "fit": ["0"],
+        "pan_left": ["a"],
+        "pan_right": ["d"],
+        "pan_up": ["w"],
+        "pan_down": ["s"],
+        "local_depth": ["L"],
+        "depth_up": ["]"],
+        "depth_down": ["["],
+        "missing": ["m"],
+        "filter": ["/"],
+        "help": ["?", "f1"],
+    },
+    "gfilter": {
+        "cancel": ["esc"],
+        "accept": ["enter"],
+        "erase": ["backspace"],
     },
     "insert": {
         "normal": ["esc"],
@@ -846,7 +891,11 @@ def list_pages(library: Path) -> dict[str, Path]:
         parts = path.relative_to(library).parts
         if any(part.startswith(".") for part in parts):
             continue
-        found[page_slug(path, library).lower()] = path
+        try:
+            slug = page_slug(path, library)
+        except ValueError:
+            continue  # a symlink that leaves the library is not a page
+        found[slug.lower()] = path
     return found
 
 
@@ -1398,6 +1447,8 @@ def open_image(note: Path, raw: str, tools: dict[str, str | None] | None = None,
         return "image path refused"
     if target is None:
         return "not a local image"
+    if target.suffix.lower() not in IMAGE_EXT:
+        return "not an image"  # the opener would run whatever handles the file
     if not target.is_file():
         return "image missing"
     found = tools or image_tools()
@@ -1455,7 +1506,9 @@ def doc_layout(
                     missing = not dest.startswith(REMOTE)
                 elif not target.is_file():
                     missing = True
-                else:
+                elif not Path(dest).is_absolute():
+                    # A page only previews pictures beside it. An absolute path
+                    # shows as a caption and opens on a keypress.
                     paint = preview if preview is not None else chafa_preview
                     rows = paint(target, inner) or []
             for line in rows:
@@ -1561,6 +1614,19 @@ def help_lines(name: str, keys: KeyMap | None = None) -> tuple[str, ...]:
         "  ctrl+c          quit, always",
         f"  {bound.show('normal', 'help')}   help",
         "",
+        "Graph",
+        f"  {bound.show('list', 'graph')} (shelf) or {bound.show('normal', 'graph')} (page)   the graph",
+        f"  {bound.show('graph', 'select_left')} {bound.show('graph', 'select_right')} {bound.show('graph', 'select_up')} {bound.show('graph', 'select_down')}   move the selection",
+        f"  {bound.show('graph', 'open')}   open the selected page",
+        f"  {bound.show('graph', 'leave')}   back; from the page it returns here",
+        f"  {bound.show('graph', 'zoom_in')} {bound.show('graph', 'zoom_out')} zoom   {bound.show('graph', 'fit')} re-fit",
+        f"  {bound.show('graph', 'pan_left')} {bound.show('graph', 'pan_down')} {bound.show('graph', 'pan_up')} {bound.show('graph', 'pan_right')}   pan",
+        f"  {bound.show('graph', 'local_depth')}   local graph   {bound.show('graph', 'depth_down')} {bound.show('graph', 'depth_up')} depth 1..5",
+        f"  {bound.show('graph', 'missing')}   show or hide missing pages",
+        f"  {bound.show('graph', 'filter')}   keep pages, {bound.show('graph', 'leave')} clears it",
+        "  mouse   click to select, again to open, wheel zooms",
+        f"  ctrl+c  quit    {bound.show('graph', 'quit')} quits",
+        "",
         "Keys live in ~/.grimoire/keys.json. grimoire keys writes the file.",
         "The line you are on is the source.",
         "Other lines of a .md file hide #  **  and _ markers.",
@@ -1600,6 +1666,7 @@ class App:
         self.pref_col = 0
         self.query = ""
         self.note = ""
+        self.truncated = False
         self.message = ""
         self.dirty = False
         self.inserting = False
@@ -1616,6 +1683,18 @@ class App:
         self._coalesce: str | None = None
         self.naming = "page"
         self.shelf_stamp: tuple[str, ...] = ()
+        self.gdata: dict | None = None
+        self.gstate: dict | None = None
+        self.gsel = ""
+        self.gview: dict | None = None
+        self.glocal: int | None = None
+        self.gmissing = True
+        self.gfilter = ""
+        self.gquery = ""
+        self.graph_from = "list"
+        self.graph_return = False
+        self.glast: tuple[int, int] = (80, 24)
+        self.gshown: dict | None = None
         if open_file is not None:
             self.open_path(open_file)
         else:
@@ -1659,6 +1738,7 @@ class App:
 
     def open_path(self, path: Path) -> None:
         self.lines, self.note = read_lines(path)
+        self.truncated = bool(self.note)
         self.newline, self.final_newline = line_style(path)
         self.fences = fence_flags(self.lines)
         self.path = path
@@ -1703,6 +1783,9 @@ class App:
     def begin_cell_edit(self) -> None:
         table = self.table()
         if table is None:
+            return
+        if self.truncated:
+            self.message = READ_ONLY
             return
         if self.lines[self.row].count('"') % 2:
             self.message = "multi-line cell, use i to edit raw"
@@ -1853,6 +1936,9 @@ class App:
         if self.path is None:
             self.message = "no file"
             return False
+        if self.truncated:
+            self.message = READ_ONLY  # saving would drop every line past the cut
+            return False
         newline = getattr(self, "newline", "\n")
         text = newline.join(self.lines)
         if text and getattr(self, "final_newline", True) and not text.endswith(newline):
@@ -1963,6 +2049,10 @@ class App:
             return self.handle_name(key)
         if self.mode == "filter":
             return self.handle_filter(key)
+        if self.mode == "graph":
+            return self.handle_graph(key)
+        if self.mode == "gfilter":
+            return self.handle_gfilter(key)
         if self.mode == "list":
             return self.handle_list(key)
         return self.handle_read(key)
@@ -1972,6 +2062,8 @@ class App:
             return False
         if self.keys.pressed("list", "back", key):
             return self.go_up()
+        if self.keys.pressed("list", "graph", key):
+            return self.open_graph()
         if self.keys.pressed("list", "up", key):
             self.selected = max(0, self.selected - 1)
         elif self.keys.pressed("list", "down", key):
@@ -1998,6 +2090,9 @@ class App:
         return True
 
     def begin_insert(self, *, append: bool) -> None:
+        if self.truncated:
+            self.message = READ_ONLY
+            return
         if self.delimiter and not append:
             self.col = cell_offset(self.lines[self.row], self.delimiter, self.tcol)
             self.pref_col = self.col
@@ -2112,7 +2207,13 @@ class App:
                 self.mode = "confirm"
                 self.message = "leave"
                 return True
+            if self.graph_return and leaving:
+                self.graph_return = False
+                self.mode = "graph"
+                return True
             return self.leave_reader() if leaving else False
+        if self.keys.pressed("normal", "graph", key):
+            return self.open_graph()
         if self.keys.pressed("normal", "find", key):
             self.query = ""
             self.mode = "search"
@@ -2151,6 +2252,13 @@ class App:
                 return hit
         return True
 
+    def back_to_graph(self) -> bool:
+        """Leave a page for the graph it was opened from."""
+        self.graph_return = False
+        self.mode = "graph"
+        self.message = ""
+        return True
+
     def handle_confirm(self, key: int | str) -> bool:
         if self.keys.pressed("confirm", "yes", key):
             if self.message == "reload":
@@ -2161,6 +2269,8 @@ class App:
                 self.message = "reloaded"
                 return True
             if self.save():
+                if self.graph_return:
+                    return self.back_to_graph()
                 return self.leave_reader()
             self.mode = "read"
             return True
@@ -2169,6 +2279,8 @@ class App:
                 self.mode = "read"
                 self.message = ""
                 return True
+            if self.graph_return:
+                return self.back_to_graph()
             return self.leave_reader()
         if self.keys.pressed("confirm", "stay", key):
             self.mode = "read"
@@ -2243,6 +2355,736 @@ class App:
         if self.take_query(key, "filter"):
             self.selected = 0
         return True
+
+    # Graph view ----------------------------------------------------------------
+
+    def open_graph(self) -> bool:
+        cfg = load_config()
+        library = library_path(cfg)
+        data = build_graph(library)
+        if not data["pages"]:
+            self.message = "no pages to graph"
+            return True
+        slug = ""
+        if self.path is not None:
+            try:
+                slug = page_slug(self.path, library).lower()
+            except ValueError:
+                slug = ""
+        self.gdata = data
+        self.gsel = graph_home(data, slug)
+        self.glocal = None
+        self.gmissing = True
+        self.gfilter = ""
+        self.gquery = ""
+        self.graph_from = self.mode if self.mode in ("list", "read") else "list"
+        self.graph_return = False
+        self.gview = None
+        self.mode = "graph"
+        self.graph_refresh()
+        if self.gstate is not None and len(self.gstate["shown"]) > GRAPH_NODE_MAX:
+            settle_layout(self.gstate, seconds=2.0)
+            self.message = f"{len(self.gstate['shown'])} nodes, settled before draw"
+        return True
+
+    def graph_refresh(self) -> None:
+        if self.gdata is None:
+            return
+        nodes, edges = graph_subset(self.gdata, self.gsel, self.glocal, self.gmissing, self.gfilter)
+        if self.gsel not in nodes:
+            keep_pages = {key: value for key, value in self.gdata["pages"].items() if key in nodes}
+            self.gsel = graph_home({"pages": keep_pages}, "") if keep_pages else ""
+        old = (self.gstate or {}).get("pos", {})
+        pos = {slug: old[slug] for slug in nodes if slug in old}
+        pos.update({slug: xy for slug, xy in seed_positions(sorted(set(nodes) - set(pos))).items()})
+        self.gstate = {
+            "pos": pos,
+            "vel": {slug: (0.0, 0.0) for slug in nodes},
+            "edges": edges,
+            "links": link_map(edges),
+            "settled": False,
+            "moved": float("inf"),
+            "started": time.perf_counter(),
+        }
+        self.gshown = {"nodes": nodes, "edges": edges, "colors": graph_colors(nodes)}
+        self.gstate["shown"] = nodes
+        self.gstate["colors"] = graph_colors(nodes)
+        self.gview = None
+
+    def close_graph(self) -> bool:
+        if self.graph_from == "read" and self.path is not None:
+            self.mode = "read"
+        else:
+            self.mode = "list"
+            self.refresh(keep=self.path)
+        self.message = ""
+        return True
+
+    def step_graph(self) -> None:
+        """Batch physics steps to use most of the 33 ms frame, then redraw."""
+        st = self.gstate
+        if st is None or st.get("settled"):
+            return
+        budget = time.perf_counter() + 0.02
+        count = max(1, len(st["pos"]))
+        for _ in range(30):
+            step_layout(st)
+            if st["moved"] / count < 0.002:
+                st["settled"] = True
+                if self.gview is not None and self.gview.get("auto"):
+                    self.gview = None
+                break
+            if time.perf_counter() >= budget:
+                break
+        if time.perf_counter() - st["started"] > GRAPH_ANIMATE_SECONDS:
+            # a very large graph could keep drifting for minutes; freeze it
+            st["settled"] = True
+            if self.gview is not None and self.gview.get("auto"):
+                self.gview = None
+
+    def graph_open_selected(self) -> bool:
+        nodes = self.gshown["nodes"]
+        node = nodes.get(self.gsel)
+        if node is None or node["missing"]:
+            self.message = "no page behind that node"
+            return True
+        self.graph_return = True
+        self.message = ""
+        self.open_path(Path(node["path"]))
+        return True
+
+    def handle_graph(self, key: int | str) -> bool:
+        if self.keys.pressed("graph", "quit", key):
+            return False
+        if self.keys.pressed("graph", "leave", key):
+            if self.gfilter:
+                self.gfilter = ""
+                self.graph_refresh()
+                return True
+            return self.close_graph()
+        if self.keys.pressed("graph", "open", key):
+            return self.graph_open_selected()
+        if self.keys.pressed("graph", "help", key):
+            self.help_from = "graph"
+            self.help_at = 0
+            self.mode = "help"
+            return True
+        if self.keys.pressed("graph", "filter", key):
+            self.gquery = ""
+            self.mode = "gfilter"
+            return True
+        moves = {"select_up": (0, -1), "select_down": (0, 1), "select_left": (-1, 0), "select_right": (1, 0)}
+        for action, vector in moves.items():
+            if self.keys.pressed("graph", action, key):
+                self.graph_move(vector)
+                return True
+        pans = {"pan_left": (-1, 0), "pan_right": (1, 0), "pan_up": (0, -1), "pan_down": (0, 1)}
+        for action, (sx, sy) in pans.items():
+            if self.keys.pressed("graph", action, key):
+                cols, rows = self.glast
+                if self.gview is not None:
+                    self.gview = pan_view(self.gview, 4 * sx, 4 * sy, cols, rows - 1)
+                return True
+        if self.keys.pressed("graph", "zoom_in", key):
+            if self.gview is not None:
+                self.gview = zoom_view(self.gview, 1.25)
+            return True
+        if self.keys.pressed("graph", "zoom_out", key):
+            if self.gview is not None:
+                self.gview = zoom_view(self.gview, 0.8)
+            return True
+        if self.keys.pressed("graph", "fit", key):
+            self.gview = None
+            return True
+        if self.keys.pressed("graph", "local_depth", key):
+            if self.glocal is None:
+                self.glocal = 1
+            else:
+                self.glocal = min(5, self.glocal + 1) if self.glocal < 5 else None
+            self.graph_refresh()
+            return True
+        if self.keys.pressed("graph", "depth_up", key):
+            self.glocal = min(5, (self.glocal or 0) + 1)
+            self.graph_refresh()
+            return True
+        if self.keys.pressed("graph", "depth_down", key):
+            depth = (self.glocal or 1) - 1
+            self.glocal = depth if depth >= 1 else None
+            self.graph_refresh()
+            return True
+        if self.keys.pressed("graph", "missing", key):
+            self.gmissing = not self.gmissing
+            self.graph_refresh()
+            return True
+        return True
+
+    def graph_move(self, vector: tuple[int, int]) -> None:
+        st = self.gstate
+        if st is None or self.gsel not in st["pos"]:
+            return
+        cols, rows = self.glast
+        if self.gview is None:
+            self.gview = fit_view(st["pos"], cols, rows - 1)
+        screen = graph_screen(st, self.gview, cols, rows - 1)
+        if self.gsel not in screen:
+            return
+        self.gsel = cone_pick(screen, self.gsel, vector)
+
+    def handle_gfilter(self, key: int | str) -> bool:
+        if self.keys.pressed("gfilter", "cancel", key):
+            self.gquery = ""
+            self.mode = "graph"
+            return True
+        if self.keys.pressed("gfilter", "accept", key):
+            self.gfilter = self.gquery
+            self.graph_refresh()
+            if self.gstate is not None and not self.gstate["shown"]:
+                self.message = f"no pages match /{self.gfilter}"
+            self.gquery = ""
+            self.mode = "graph"
+            return True
+        if self.keys.pressed("gfilter", "erase", key):
+            self.gquery = self.gquery[:-1]
+            return True
+        if isinstance(key, int) and 32 <= key < 127:
+            self.gquery += chr(key)
+        return True
+
+    def graph_mouse(self) -> bool:
+        try:
+            _, x, y, _, bstate = curses.getmouse()
+        except curses.error:
+            return True
+        cols, rows = self.glast
+        view = self.gview
+        st = self.gstate
+        if st is None or view is None:
+            return True
+        dot = ((x + 0.5) * 2, (y + 0.5) * 4)
+        if bstate & curses.BUTTON4_PRESSED:
+            self.gview = zoom_view(view, 1.25, dot[0], dot[1], cols, rows - 1)
+            return True
+        if bstate & curses.BUTTON5_PRESSED:
+            self.gview = zoom_view(view, 0.8, dot[0], dot[1], cols, rows - 1)
+            return True
+        if bstate & (curses.BUTTON1_DOUBLE_CLICKED | curses.BUTTON1_TRIPLE_CLICKED):
+            return self.graph_open_selected()
+        if bstate & curses.BUTTON1_PRESSED:
+            screen = graph_screen(st, view, cols, rows - 1)
+            if not screen:
+                return True
+            best = min(screen, key=lambda slug: math.hypot(screen[slug][0] - dot[0], screen[slug][1] - dot[1]))
+            if math.hypot(screen[best][0] - dot[0], screen[best][1] - dot[1]) > 24:
+                return True
+            if best == self.gsel:
+                return self.graph_open_selected()
+            self.gsel = best
+        return True
+
+
+# Graph view. Positions, projection and raster plans are plain data, so the
+# tests run without a tty. Only draw_graph touches the screen.
+
+MISSING_MARK = "\x00"
+GRAPH_NODE_MAX = 400
+GRAPH_STEP_SECONDS = 0.033
+GRAPH_ANIMATE_SECONDS = 12.0  # keep spinning at most this long before freezing
+GRAPH_COLOR_ROLES = tuple(f"graph_{n}" for n in range(1, 9))
+
+
+def graph_folder(slug: str) -> str:
+    return slug.rsplit("/", 1)[0] if "/" in slug else ""
+
+
+def graph_nodes(data: dict) -> dict[str, dict]:
+    """Every real page plus one hollow node per missing link target."""
+    nodes: dict[str, dict] = {}
+    for slug, page in data["pages"].items():
+        nodes[slug] = {
+            "slug": slug,
+            "title": page["title"],
+            "folder": graph_folder(slug),
+            "path": page["path"],
+            "missing": False,
+            "degree": 0,
+        }
+    for slug, page in data["pages"].items():
+        for raw in page["missing"]:
+            ghost = MISSING_MARK + raw
+            if ghost not in nodes:
+                nodes[ghost] = {
+                    "slug": ghost,
+                    "title": raw,
+                    "folder": graph_folder(raw),
+                    "path": "",
+                    "missing": True,
+                    "degree": 0,
+                }
+    return nodes
+
+
+def graph_links(data: dict, nodes: dict) -> list[tuple[str, str]]:
+    """Undirected edges, deduped, real and missing."""
+    edges: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(a: str, b: str) -> None:
+        key = (a, b) if a <= b else (b, a)
+        if key in seen:
+            return
+        seen.add(key)
+        edges.append(key)
+
+    for slug, page in data["pages"].items():
+        for dest in page["links"]:
+            if dest in nodes:
+                add(slug, dest)
+        for raw in page["missing"]:
+            add(slug, MISSING_MARK + raw)
+    for a, b in edges:
+        nodes[a]["degree"] += 1
+        nodes[b]["degree"] += 1
+    return edges
+
+
+GRAPH_REPEL = 0.03
+GRAPH_SPRING = 0.06
+GRAPH_REST = 0.5
+GRAPH_GRAVITY = 0.02
+GRAPH_DAMP = 0.85
+GRAPH_SPEED = 0.25
+
+
+def seed_positions(slugs: list[str]) -> dict[str, tuple[float, float]]:
+    """Initial positions hashed from the slug. Same library, same layout, always."""
+    pos: dict[str, tuple[float, float]] = {}
+    for slug in sorted(slugs):
+        raw = hashlib.sha256(slug.encode("utf-8")).digest()
+        angle = int.from_bytes(raw[:8], "big") / 2**64 * math.tau
+        radius = 0.4 + int.from_bytes(raw[8:12], "big") / 2**48 * 0.2
+        pos[slug] = (math.cos(angle) * radius, math.sin(angle) * radius)
+    return pos
+
+
+def link_map(edges: list[tuple[str, str]]) -> dict[str, list[str]]:
+    touch: dict[str, list[str]] = {}
+    for a, b in edges:
+        touch.setdefault(a, []).append(b)
+        touch.setdefault(b, []).append(a)
+    return touch
+
+
+def step_layout(state: dict) -> float:
+    """One round of repulsion, springs and gravity. Returns total movement and
+    the fastest node's movement in state['spread'] — the settle test."""
+    pos: dict[str, tuple[float, float]] = state["pos"]
+    vel: dict[str, tuple[float, float]] = state["vel"]
+    touch: dict[str, list[str]] = state["links"]
+    slugs = list(pos)
+    fresh: dict[str, tuple[float, float]] = {}
+    moved = 0.0
+    spread = 0.0
+    for slug in slugs:
+        px, py = pos[slug]
+        fx = fy = 0.0
+        for other in slugs:
+            if other == slug:
+                continue
+            ox, oy = pos[other]
+            dx, dy = px - ox, py - oy
+            dist = math.hypot(dx, dy) + 0.001
+            strength = GRAPH_REPEL / (dist * dist)
+            fx += strength * dx / dist
+            fy += strength * dy / dist
+        for other in touch.get(slug, ()):
+            if other not in pos:
+                continue
+            ox, oy = pos[other]
+            dx, dy = px - ox, py - oy
+            dist = math.hypot(dx, dy) + 0.001
+            strength = -GRAPH_SPRING * (dist - GRAPH_REST) / dist
+            fx += strength * dx
+            fy += strength * dy
+        fx -= GRAPH_GRAVITY * px
+        fy -= GRAPH_GRAVITY * py
+        vx = max(-GRAPH_SPEED, min(GRAPH_SPEED, (vel[slug][0] + fx) * GRAPH_DAMP))
+        vy = max(-GRAPH_SPEED, min(GRAPH_SPEED, (vel[slug][1] + fy) * GRAPH_DAMP))
+        fresh[slug] = (px + vx, py + vy)
+        vel[slug] = (vx, vy)
+        moved += abs(vx) + abs(vy)
+        spread = max(spread, abs(vx), abs(vy))
+    state["pos"] = fresh
+    state["moved"] = moved
+    state["spread"] = spread
+    return moved
+
+
+def settle_layout(state: dict, max_steps: int = 300, eps: float = 0.002, seconds: float | None = None) -> dict:
+    """Run steps until the average node is slow enough, capped by count and wall time.
+
+    A total-movement threshold never fires on big graphs: five hundred nearly
+    still nodes still add up. So compare the movement per node."""
+    start = time.perf_counter()
+    steps = 0
+    count = max(1, len(state["pos"]))
+    while steps < max_steps and state.get("moved", float("inf")) / count >= eps:
+        step_layout(state)
+        steps += 1
+        if seconds is not None and time.perf_counter() - start >= seconds:
+            break
+    state["settled"] = True
+    state["steps"] = steps
+    return state
+
+
+def content_dots(cols: int, rows: int) -> tuple[int, int]:
+    return (max(1, cols - 1) * 2, max(1, rows - 1) * 4)
+
+
+def fit_view(pos: dict, cols: int, rows: int, pad: float = 4.0) -> dict:
+    """Scale and center that puts the whole graph on screen."""
+    w, h = content_dots(cols, rows)
+    if not pos:
+        return {"cx": 0.0, "cy": 0.0, "z": 1.0, "zfit": 1.0}
+    xs = [p[0] for p in pos.values()]
+    ys = [p[1] for p in pos.values()]
+    span_x = max(0.001, max(xs) - min(xs))
+    span_y = max(0.001, max(ys) - min(ys))
+    z = max(0.001, min((w - 2 * pad) / span_x, (h - 2 * pad) / span_y))
+    return {"cx": (min(xs) + max(xs)) / 2, "cy": (min(ys) + max(ys)) / 2, "z": z, "zfit": z, "auto": True}
+
+
+def project(x: float, y: float, view: dict, cols: int, rows: int) -> tuple[float, float]:
+    w, h = content_dots(cols, rows)
+    return ((x - view["cx"]) * view["z"] + w / 2, (y - view["cy"]) * view["z"] + h / 2)
+
+
+def unproject(dx: float, dy: float, view: dict, cols: int, rows: int) -> tuple[float, float]:
+    w, h = content_dots(cols, rows)
+    return (view["cx"] + (dx - w / 2) / view["z"], view["cy"] + (dy - h / 2) / view["z"])
+
+
+def zoom_view(view: dict, factor: float, dx: float | None = None, dy: float | None = None, cols: int = 0, rows: int = 0) -> dict:
+    """Zoom keeps the point under the pointer in place; without one, the center."""
+    z = max(0.001, view["z"] * factor)
+    w, h = content_dots(cols, rows)
+    fresh = {"cx": view["cx"], "cy": view["cy"], "z": z, "zfit": view.get("zfit", view["z"])}
+    if dx is not None and dy is not None:
+        wx, wy = unproject(dx, dy, view, cols, rows)
+        fresh["cx"] = wx - (dx - w / 2) / z
+        fresh["cy"] = wy - (dy - h / 2) / z
+    return fresh
+
+
+def pan_view(view: dict, dx: float, dy: float, cols: int, rows: int) -> dict:
+    return {
+        "cx": view["cx"] - dx / view["z"],
+        "cy": view["cy"] - dy / view["z"],
+        "z": view["z"],
+        "zfit": view.get("zfit", view["z"]),
+    }
+
+
+BRAILLE_BASE = 0x2800
+BRAILLE_BITS = {
+    (0, 0): 0x01, (0, 1): 0x02, (0, 2): 0x04, (0, 3): 0x40,
+    (1, 0): 0x08, (1, 1): 0x10, (1, 2): 0x20, (1, 3): 0x80,
+}
+
+
+def braille_char(bits: int) -> str:
+    return chr(BRAILLE_BASE + (bits & 0xFF))
+
+
+def canvas_new() -> dict:
+    """Cells map to braille bits. Empty cell means an empty dot pattern."""
+    return {}
+
+
+def canvas_plot(canvas: dict, dx: float, dy: float) -> None:
+    cell = (int(dx) // 2, int(dy) // 4)
+    canvas[cell] = canvas.get(cell, 0) | BRAILLE_BITS[(int(dx) % 2, int(dy) % 4)]
+
+
+def canvas_line(canvas: dict, x0: float, y0: float, x1: float, y1: float) -> set[tuple[int, int]]:
+    """Bresenham in dot space. Returns the cells it touched, for edge colors."""
+    touched: set[tuple[int, int]] = set()
+    steps = max(abs(x1 - x0), abs(y1 - y0))
+    count = int(steps)
+    if count == 0:
+        canvas_plot(canvas, x0, y0)
+        touched.add((int(x0) // 2, int(y0) // 4))
+        return touched
+    for i in range(count + 1):
+        x = x0 + (x1 - x0) * i / count
+        y = y0 + (y1 - y0) * i / count
+        canvas_plot(canvas, x, y)
+        touched.add((int(x) // 2, int(y) // 4))
+    return touched
+
+
+def canvas_disc(canvas: dict, dx: float, dy: float, radius: float) -> list[tuple[int, int]]:
+    """Filled dot cluster sized by degree, like Obsidian. Returns its cells."""
+    span = max(1, int(radius) + 1)
+    touched: list[tuple[int, int]] = []
+    for iy in range(int(dy) - span, int(dy) + span + 1):
+        for ix in range(int(dx) - span, int(dx) + span + 1):
+            if (ix - dx) ** 2 + (iy - dy) ** 2 <= radius * radius:
+                canvas_plot(canvas, ix, iy)
+                touched.append((int(ix) // 2, int(iy) // 4))
+    return touched
+
+
+def canvas_ring(canvas: dict, dx: float, dy: float, radius: float) -> list[tuple[int, int]]:
+    """Hollow dot circle for a page that does not exist. Returns its cells."""
+    span = max(1, int(radius) + 1)
+    touched: list[tuple[int, int]] = []
+    for iy in range(int(dy) - span, int(dy) + span + 1):
+        for ix in range(int(dx) - span, int(dx) + span + 1):
+            if abs(math.hypot(ix - dx, iy - dy) - radius) <= 0.9:
+                canvas_plot(canvas, ix, iy)
+                touched.append((int(ix) // 2, int(iy) // 4))
+    return touched
+
+
+def canvas_rows(canvas: dict, cols: int, rows: int) -> list[str]:
+    w = max(0, cols - 1)
+    out: list[str] = []
+    for ry in range(rows):
+        out.append("".join(braille_char(canvas.get((rx, ry), 0)) for rx in range(w)))
+    return out
+
+
+def graph_colors(nodes: dict) -> dict[str, str]:
+    """One palette color per folder, in sorted order; top-level is its own group."""
+    folders = sorted({node["folder"] for node in nodes.values()})
+    pick = {folder: GRAPH_COLOR_ROLES[i % len(GRAPH_COLOR_ROLES)] for i, folder in enumerate(folders)}
+    return {slug: pick[node["folder"]] for slug, node in nodes.items()}
+
+
+def node_radius(node: dict) -> float:
+    if node["missing"]:
+        return 2.5
+    return 1.5 + min(5, node["degree"]) * 0.75
+
+
+def graph_home(data: dict, want: str) -> str:
+    """Where selection starts: the page you came from, else index, else most linked."""
+    pages = data["pages"]
+    if want in pages:
+        return want
+    if "index" in pages:
+        return "index"
+    if not pages:
+        return ""
+    return max(
+        pages,
+        key=lambda slug: len(pages[slug]["links"]) + len(pages[slug]["backlinks"]),
+    )
+
+
+def local_nodes(nodes: dict, edges: list[tuple[str, str]], slug: str, depth: int) -> set[str]:
+    """Nodes within depth link steps, forwards and backwards."""
+    touch = link_map(edges)
+    kept = {slug}
+    edge = {slug}
+    for _ in range(max(1, depth)):
+        near: set[str] = set()
+        for here in edge:
+            for there in touch.get(here, ()):
+                if there not in kept:
+                    near.add(there)
+        kept |= near
+        edge = near
+    return kept
+
+
+def filter_slugs(nodes: dict, query: str) -> set[str]:
+    needle = query.lower()
+    return {
+        slug
+        for slug, node in nodes.items()
+        if needle in slug.lower() or needle in node["title"].lower()
+    }
+
+
+def graph_subset(
+    data: dict,
+    slug: str,
+    depth: int | None,
+    missing: bool,
+    query: str,
+) -> tuple[dict, list[tuple[str, str]]]:
+    """The nodes and edges for the current local, missing and text filters."""
+    nodes = graph_nodes(data)
+    edges = graph_links(data, nodes)
+    if depth is not None:
+        keep = local_nodes(nodes, edges, slug, depth)
+        nodes = {key: node for key, node in nodes.items() if key in keep}
+        edges = [(a, b) for a, b in edges if a in nodes and b in nodes]
+    if not missing:
+        ghosts = {key for key, node in nodes.items() if node["missing"]}
+        nodes = {key: node for key, node in nodes.items() if key not in ghosts}
+        edges = [(a, b) for a, b in edges if a in nodes and b in nodes]
+    if query:
+        keep = filter_slugs(nodes, query)
+        nodes = {key: node for key, node in nodes.items() if key in keep}
+        edges = [(a, b) for a, b in edges if a in nodes and b in nodes]
+    return nodes, edges
+
+
+def cone_pick(screen: dict, origin: str, vector: tuple[int, int]) -> str:
+    """Nearest node in a direction, in a 60 degree cone. Stays put if none."""
+    dxn, dyn = vector
+    sx, sy = screen[origin]
+    best = origin
+    best_score = 0.0
+    for slug, (x, y) in screen.items():
+        if slug == origin:
+            continue
+        dx, dy = x - sx, y - sy
+        dist = math.hypot(dx, dy)
+        if dist < 0.5:
+            continue
+        cos = (dx * dxn + dy * dyn) / dist
+        if cos < 0.5:
+            continue
+        score = dist * (2 - cos)
+        if best_score == 0.0 or score < best_score:
+            best_score = score
+            best = slug
+    return best
+
+
+def place_labels(
+    items: list[tuple[str, float, float, float, int, str]],
+    cols: int, rows: int, forced: set[str],
+) -> list[tuple[str, int, int, str]]:
+    """Rects for labels that fit. Forced ones (selected and neighbors) come first."""
+    placed: list[tuple[str, int, int, str]] = []
+    used: list[tuple[int, int, int, int]] = []
+    order = sorted(items, key=lambda item: (item[0] not in forced, -item[1], item[0]))
+    for slug, _, px, py, _, text in order:
+        if not text or len(text) + 1 >= cols:
+            continue
+        col = max(0, min(cols - 1 - len(text), int(px) // 2 - len(text) // 2))
+        row = max(0, min(rows - 2, int(py) // 4 + 1))
+        rect = (col - 1, row - 1, col + len(text) + 1, row + 1)
+        if used and any(
+            rect[0] < other[2] and rect[2] > other[0] and rect[1] < other[3] and rect[3] > other[1]
+            for other in used
+        ):
+            continue
+        placed.append((slug, col, row, text))
+        used.append(rect)
+    return placed
+
+
+def graph_screen(st: dict, view: dict, cols: int, rows: int) -> dict[str, tuple[float, float]]:
+    """Dot-space positions for the nodes currently shown."""
+    return {slug: project(x, y, view, cols, rows - 1) for slug, (x, y) in st["pos"].items() if slug in st["shown"]}
+
+
+def graph_raster(
+    st: dict,
+    screen: dict[str, tuple[float, float]],
+    selected: str,
+    neighbors: set[str],
+) -> tuple[dict, dict]:
+    """Braille bit cells plus one style per cell. Edges first, nodes on top."""
+    canvas: dict[tuple[int, int], int] = {}
+    styles: dict[tuple[int, int], str] = {}
+    for a, b in st["edges"]:
+        first = screen.get(a)
+        second = screen.get(b)
+        if first is None or second is None:
+            continue
+        style = "graph_edge_hi" if a == selected or b == selected else "graph_edge"
+        for cell in canvas_line(canvas, *first, *second):
+            styles[cell] = style
+    colors = st["colors"]
+    for slug, node in st["shown"].items():
+        at = screen.get(slug)
+        if at is None:
+            continue
+        if node["missing"]:
+            cells = canvas_ring(canvas, *at, node_radius(node))
+        else:
+            cells = canvas_disc(canvas, *at, node_radius(node))
+        for cell in cells:
+            styles[cell] = colors[slug]
+    return canvas, styles
+
+
+def place_cells(
+    canvas: dict, styles: dict, labels: list[tuple[str, int, int, str]], rows: int,
+) -> list[tuple[int, int, str, int]]:
+    """Group bit cells into paintable runs. Cells under a label are dropped."""
+    covered: set[tuple[int, int]] = set()
+    for _, col, row, text in labels:
+        covered |= {(col + i, row) for i in range(len(text))}
+    runs: list[tuple[int, int, str, int]] = []
+    order = sorted((cy, cx) for cx, cy in canvas)
+    for cy, cx in order:
+        if cx < 0 or cy < 0 or (cx, cy) in covered:
+            continue
+        bits = canvas[(cx, cy)]
+        style = styles.get((cx, cy), "graph_edge")
+        if runs:
+            prev_cy, prev_cx, prev_style, span = runs[-1]
+            if prev_cy == cy and prev_cx + span == cx and prev_style == style:
+                runs[-1] = (prev_cy, prev_cx, prev_style, span + 1)
+                continue
+        runs.append((cy, cx, style, 1))
+    _ = rows
+    return runs
+
+
+def graph_neighbors(st: dict, selected: str) -> set[str]:
+    return {other for a, b in st["edges"] for other in (a, b) if other != selected and selected in (a, b)}
+
+
+def label_attrs(st: dict, selected: str, focus: set[str]) -> dict[str, int]:
+    return {slug: (style_attr(st["colors"][slug]) | (curses.A_BOLD if slug == selected else 0)) for slug in focus}
+
+
+def draw_graph(stdscr: curses.window, app: App, rows: int, cols: int) -> None:
+    st = app.gstate
+    if not st or not st["shown"]:
+        put(stdscr, 0, 0, "(no pages)", style_attr(DIM), cols, rows)
+        app.glast = (cols, rows)
+        return
+    if app.gview is None:
+        app.gview = fit_view(st["pos"], cols, rows - 1)
+    view = app.gview
+    screen = graph_screen(st, view, cols, rows)
+    canvas, styles = graph_raster(st, screen, app.gsel, graph_neighbors(st, app.gsel))
+    focus = {app.gsel} | graph_neighbors(st, app.gsel)
+    shown_zoom = view["z"] > view.get("zfit", view["z"])
+    items: list[tuple[str, float, float, float, int, str]] = []
+    for slug, node in st["shown"].items():
+        if slug not in focus and not (shown_zoom and not node["missing"]):
+            continue
+        if node["missing"] and slug != app.gsel:
+            continue
+        at = screen[slug]
+        items.append((slug, node["degree"], at[0], at[1], node_radius(node), node["title"]))
+    labels = place_labels(items, cols, rows - 1, focus)
+    runs = place_cells(canvas, styles, labels, rows)
+    for cy, cx, style, span in runs:
+        put(
+            stdscr,
+            cy,
+            cx,
+            "".join(braille_char(canvas[(ccx, cy)]) for ccx in range(cx, cx + span)),
+            style_attr(style),
+            cols,
+            rows,
+        )
+    attrs = label_attrs(st, app.gsel, focus)
+    for slug, col, row, text in labels:
+        put(stdscr, row, col, text, attrs.get(slug, style_attr(DIM) | curses.A_BOLD), cols, rows)
+    app.glast = (cols, rows)
 
 
 def style_attr(style: str) -> int:
@@ -2391,6 +3233,47 @@ def bar_spec(app: App) -> tuple[list[str], str, str]:
         return [f"new {kind}: {app.query}", "enter make", "esc cancel"], "", ""
     if app.mode == "filter":
         return [f"/{app.query}", "enter open", "esc cancel"], "", ""
+    if app.mode == "gfilter":
+        return [f"/{app.gquery}", "enter keep", "esc cancel"], "", ""
+    if app.mode == "graph":
+        node = {}
+        if app.gshown:
+            node = app.gshown["nodes"].get(app.gsel, {})
+        page = {}
+        if app.gdata and app.gsel in app.gdata["pages"]:
+            page = app.gdata["pages"][app.gsel]
+        counts = ""
+        if page:
+            counts = f"{len(page['links'])} →  {len(page['backlinks'])} ←"
+        if node.get("missing"):
+            counts = "missing"
+        if app.glocal is not None:
+            scope = f"local, depth {app.glocal}"
+        elif app.gshown:
+            scope = f"{len(app.gshown['nodes'])} nodes"
+        else:
+            scope = ""
+        extra = ""
+        if app.gfilter:
+            extra = f"{extra} /{app.gfilter}" if extra else f"/{app.gfilter}"
+        if not app.gmissing:
+            extra = f"{extra} missing off"
+        parts = [
+            node.get("title", "the shelf"),
+            counts,
+            extra,
+            "enter open",
+            key_hint(keys, "graph", "leave", "back"),
+            f"{keys.show('graph', 'zoom_in')} {keys.show('graph', 'zoom_out')} zoom",
+            key_hint(keys, "graph", "local_depth", "local"),
+            key_hint(keys, "graph", "missing", "missing"),
+            key_hint(keys, "graph", "filter", "filter"),
+            key_hint(keys, "graph", "help", "keys"),
+            key_hint(keys, "graph", "quit", "quit"),
+        ]
+        if app.message:
+            parts.insert(0, app.message)
+        return parts, keys.show("graph", "help"), scope
     if app.mode == "list":
         parts = [
             f"{keys.show('list', 'up')} {keys.show('list', 'down')} move",
@@ -2483,6 +3366,8 @@ def draw(stdscr: curses.window, app: App) -> None:
         return
     if app.mode in ("list", "name", "filter"):
         draw_list(stdscr, app, rows, cols)
+    elif app.mode in ("graph", "gfilter"):
+        draw_graph(stdscr, app, rows, cols)
     else:
         draw_read(stdscr, app, rows, cols)
     if app.mode == "help":
@@ -2682,6 +3567,7 @@ grimoire mcp               stdio MCP server for agents
 grimoire plugins          list plugins in ~/.grimoire/plugins
 grimoire images           which image tools are installed
 grimoire theme            write ~/.grimoire/theme.json if missing, then print it
+grimoire --version        print the version
 
 Config: ~/.grimoire/config.json
   name      text on the title row (default GRIMOIRE)
@@ -2999,7 +3885,7 @@ def serve_mcp() -> None:
             result = {
                 "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "grimoire", "version": "1.0.0"},
+                "serverInfo": {"name": "grimoire", "version": __version__},
             }
         elif method == "ping":
             result = {}
@@ -3039,13 +3925,22 @@ def main(stdscr: curses.window, app: App) -> None:
     stdscr.keypad(True)
     pending = True
     try:
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        except curses.error:
+            pass
         while True:
-            stdscr.timeout(400 if app.mode == "list" else -1)
+            busy = app.mode == "graph" and app.gstate is not None and not app.gstate.get("settled", True)
+            stdscr.timeout(33 if busy else 400 if app.mode == "list" else -1)
             if pending:
                 draw(stdscr, app)
                 pending = False
             key = stdscr.getch()
             if key == -1:
+                if busy:
+                    app.step_graph()
+                    pending = True
+                    continue
                 pending = app.poll_shelf()
                 continue
             if not app.handle(key):
@@ -3059,6 +3954,9 @@ def run(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] in ("help", "--help", "-h"):
         print(USAGE, end="")
+        return
+    if args and args[0] in ("--version", "-V"):
+        print(f"grimoire {__version__}")
         return
     if args and args[0] == "plugins":
         host = load_plugins()

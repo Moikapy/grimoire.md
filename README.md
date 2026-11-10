@@ -6,13 +6,22 @@ The name is the lore. Phylactery is already Lich's session files, and Ossuary is
 
 ## Install
 
-Needs Python 3. curses is in the standard library.
+Needs Python 3.10 or newer on Linux or macOS. Nothing else: curses is in the standard library.
 
 ```sh
-git clone <url> grimoire
+pipx install grimoire-md      # or: uv tool install grimoire-md
+npm install -g grimoire-md    # same program, started by a small Node shim
+grimoire --help
+```
+
+The npm package still runs on your Python. Set `GRIMOIRE_PYTHON` if the right one is not `python3`.
+
+From a clone:
+
+```sh
+git clone https://github.com/Moikapy/grimoire.md grimoire
 cd grimoire
 ln -sfn "$(pwd)/grimoire.py" ~/.local/bin/grimoire
-grimoire --help
 ```
 
 No install step copies config. Each person gets their own `~/.grimoire/config.json` the first time they run `grimoire setup`. Plugins stay in `~/.grimoire/plugins` and are not part of the clone.
@@ -26,8 +35,6 @@ grimoire --local          # same as -c
 grimoire path/to/file.md
 grimoire setup            # shelf path and the name on screen
 ```
-
-`folio` still runs the same program.
 
 Keys are `~/.grimoire/keys.json`. `grimoire keys` writes it if it is missing. Action names stay fixed. You change the key list. ctrl+c always quits.
 
@@ -49,11 +56,27 @@ Config is `~/.grimoire/config.json`:
 
 Colors are `~/.grimoire/theme.json`. `grimoire theme` writes it if it is missing. Names are `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, and `default`. A number from 0 to 255 also works when the terminal has that color. The background is always the terminal's. The font is the terminal's too. Restart Grimoire after an edit.
 
-Plugins are plain Python files in `~/.grimoire/plugins`. Each one defines `register(api)`. Core keys win. A handler returns False to quit the app. `grimoire plugins` lists what loaded. Copy `examples/linecount.py` there to try one: ctrl+w reports the line count.
+Plugins are plain Python files in `~/.grimoire/plugins`. Each one defines `register(api)`. A plugin runs with your full permissions the moment Grimoire starts, so only copy in files you have read. Core keys win. A handler returns False to quit the app. `grimoire plugins` lists what loaded. Copy `examples/linecount.py` there to try one: ctrl+w reports the line count.
+
+## Graph
+
+`g` on the shelf opens the graph of the whole library. ctrl+g on a page opens it with that page selected (`g` on a page still jumps to the top, like everywhere else). Pages that link to nothing still sit on their own: every node repels the others, links act as springs, and a little gravity pulls the whole thing to the middle. The same library settles in the same shape every time.
+
+The picture is drawn with braille dots, two per column and four per row, so lines stay lines. Each folder gets one color from the theme (`graph_1` to `graph_8`, in sorted folder order; top-level pages are their own group) and each link is a dim line. Color roles go in `~/.grimoire/theme.json` like the rest. The selected page and its neighbors get bold labels and bright edges; other labels appear when they fit. Arrow keys or `hjkl` move the selection to the nearest node in that direction. Enter opens the page, and Esc on the page returns to the graph, Esc in the graph returns to where you came from. The node's size grows with its link count.
+
+`+` and `-` zoom, `0` re-fits the whole graph, and `w a s d` pans. Labels fade like in Obsidian: zoomed out you see only the selected page and its neighbors, zoomed in you see more. The mouse works too: click to select, click the same node again or double-click to open it, scroll wheel zooms around the pointer. Without a mouse everything still works from the keys.
+
+`L` turns on the local graph: only the nodes within N link-steps of the selected page, in either direction. `[` and `]` change N from 1 to 5, and turning L off brings the whole graph back. The footer says `local, depth N`.
+
+Links to pages that do not exist show as hollow dim nodes with the raw link text as the label when selected. `m` hides them, `m` again shows them.
+
+`/` filters: type a few letters, and only pages with those letters in the slug or the title stay, with the edges between them. Esc clears the filter. ? lists the graph keys.
+
+Physics is O(n^2) per step, so a few hundred nodes animate at a comfortable pace; above 400 nodes the graph settles before the first draw, capped at two seconds, then keeps settling as you watch (an oversized graph stops moving after about twelve seconds). Opening a very large library takes a moment the first time. Node dragging with the mouse is not supported.
 
 ## Images
 
-A line that is only `![alt](path.png)` shows the alt text and the path. The cursor line stays the raw markdown. Nothing is downloaded. A web address stays text.
+A line that is only `![alt](path.png)` shows the alt text and the path. The cursor line stays the raw markdown. Nothing is downloaded. A web address stays text. Only a picture beside the page or below it gets a preview. An absolute path shows as its caption and still opens on enter. Enter opens image files only.
 
 Two optional tools. Neither is required.
 
@@ -83,4 +106,10 @@ def register(api):
     api.on("open", remember)     # also "save" and "leave"
 ```
 
+## Limits
 
+A file longer than 8000 lines opens read-only, showing the first 8000. Saving it would drop the rest.
+
+## License
+
+MIT. See `LICENSE`.
