@@ -16,7 +16,9 @@ grimoire --help
 uv tool upgrade grimoire-md   # later, to update
 ```
 
-`pipx install git+https://github.com/Moikapy/grimoire.md` does the same with the Python you already have. While the repo is private, sign git in first (`gh auth login`).
+The upgrade pulls the newest commit. It can say `Nothing to upgrade` when the version number has not changed, and still have updated.
+
+`pipx install git+https://github.com/Moikapy/grimoire.md` does the same with the Python you already have.
 
 With npm instead: `npm install -g github:Moikapy/grimoire.md`. That is a small Node shim that still runs on your Python. Set `GRIMOIRE_PYTHON` if the right one is not `python3`, and on Windows run `pip install windows-curses` yourself.
 
@@ -62,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/Moikapy/grimoire.md/master/skills/g
   -o ~/.claude/skills/grimoire/SKILL.md
 ```
 
-Use `.claude/skills/grimoire/` inside a repo to share it with everyone on that project. Both links need the repo to be public; while it is private, copy the file from a clone instead.
+Use `.claude/skills/grimoire/` inside a repo to share it with everyone on that project.
 
 To connect the MCP server to one project:
 
