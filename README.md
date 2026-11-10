@@ -6,15 +6,21 @@ The name is the lore. Phylactery is already Lich's session files, and Ossuary is
 
 ## Install
 
-Needs Python 3.10 or newer on Linux or macOS. Nothing else: curses is in the standard library.
+Runs on Linux, macOS, and Windows. Needs Python 3.10 or newer and nothing else (Windows also pulls in `windows-curses`, automatically).
+
+Straight from GitHub, no registry needed. [uv](https://docs.astral.sh/uv/) brings its own Python:
 
 ```sh
-pipx install grimoire-md      # or: uv tool install grimoire-md
-npm install -g grimoire-md    # same program, started by a small Node shim
+uv tool install git+https://github.com/Moikapy/grimoire.md
 grimoire --help
+uv tool upgrade grimoire-md   # later, to update
 ```
 
-The npm package still runs on your Python. Set `GRIMOIRE_PYTHON` if the right one is not `python3`.
+`pipx install git+https://github.com/Moikapy/grimoire.md` does the same with the Python you already have. While the repo is private, sign git in first (`gh auth login`).
+
+With npm instead: `npm install -g github:Moikapy/grimoire.md`. That is a small Node shim that still runs on your Python. Set `GRIMOIRE_PYTHON` if the right one is not `python3`, and on Windows run `pip install windows-curses` yourself.
+
+On Android, Termux counts as Linux. On a phone or tablet without a terminal, ssh to a machine that has it.
 
 From a clone:
 
@@ -23,8 +29,6 @@ git clone https://github.com/Moikapy/grimoire.md grimoire
 cd grimoire
 ln -sfn "$(pwd)/grimoire.py" ~/.local/bin/grimoire
 ```
-
-No install step copies config. Each person gets their own `~/.grimoire/config.json` the first time they run `grimoire setup`. Plugins stay in `~/.grimoire/plugins` and are not part of the clone.
 
 ## Use
 
@@ -58,6 +62,21 @@ Colors are `~/.grimoire/theme.json`. `grimoire theme` writes it if it is missing
 
 Plugins are plain Python files in `~/.grimoire/plugins`. Each one defines `register(api)`. A plugin runs with your full permissions the moment Grimoire starts, so only copy in files you have read. Core keys win. A handler returns False to quit the app. `grimoire plugins` lists what loaded. Copy `examples/linecount.py` there to try one: ctrl+w reports the line count.
 
+## tmux, Herdr, ssh
+
+Grimoire runs inside a multiplexer or over ssh with nothing to set up. Text you type can be any script, not only ASCII.
+
+If `TERM` names a terminal the machine has no entry for (common inside tmux or over ssh from a newer terminal), Grimoire falls back to `xterm-256color` instead of failing.
+
+Two tmux settings are yours to make:
+
+```sh
+set -g mouse on          # clicks and the scroll wheel reach Grimoire
+set -sg escape-time 10   # older tmux waits half a second on esc
+```
+
+Without the mouse everything still works from the keys.
+
 ## Graph
 
 `g` on the shelf opens the graph of the whole library. ctrl+g on a page opens it with that page selected (`g` on a page still jumps to the top, like everywhere else). Pages that link to nothing still sit on their own: every node repels the others, links act as springs, and a little gravity pulls the whole thing to the middle. The same library settles in the same shape every time.
@@ -87,12 +106,15 @@ grimoire images
 | tool | if it is installed | if it is not |
 | --- | --- | --- |
 | `chafa` | a small text preview in the reader | the alt text and the path |
-| `imv` | enter or o opens the file | `xdg-open` is the backup |
-| neither opener | | the footer says `install imv to view images` |
+| `imv` | enter or o opens the file | `xdg-open` on Linux, `open` on macOS, the default app on Windows |
+| no opener | | the footer says `install imv to view images` |
 
 ```sh
 # Arch
 sudo pacman -S chafa imv
+
+# macOS
+brew install chafa
 ```
 
 `chafa` is only used as symbols, so the preview is text and works in Ghostty, foot, Alacritty, Herdr, or ssh. It does not send Kitty or sixel sequences. The real picture is the viewer.
