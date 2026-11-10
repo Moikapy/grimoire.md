@@ -8,6 +8,7 @@ const path = require("node:path");
 const script = path.join(__dirname, "..", "grimoire.py");
 const wanted = [3, 10];
 const candidates = [process.env.GRIMOIRE_PYTHON, "python3", "python"].filter(Boolean);
+if (process.platform === "win32") candidates.push("py"); // the Python launcher
 
 function recentEnough(command) {
   const probe = spawnSync(
@@ -28,7 +29,13 @@ if (!python) {
 
 // The reader owns ctrl+c and ctrl+z (undo) while it runs. Node only waits.
 // Without a SIGTSTP handler the shell would stop Node and leave the reader running.
-for (const name of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP"]) process.on(name, () => {});
+for (const name of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP"]) {
+  try {
+    process.on(name, () => {});
+  } catch {
+    // Windows does not have every one of these
+  }
+}
 
 const result = spawnSync(python, [script, ...process.argv.slice(2)], { stdio: "inherit" });
 if (result.error) {

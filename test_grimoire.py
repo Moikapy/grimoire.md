@@ -502,7 +502,7 @@ class ParseTests(unittest.TestCase):
             self.assertNotIn("@@@@", raw)
 
     def test_image_tools_prefer_imv_and_say_when_missing(self):
-        tools = grimoire.image_tools(which=lambda name: {"imv": "/usr/bin/imv", "xdg-open": "/usr/bin/xdg-open"}.get(name))
+        tools = grimoire.image_tools(which=lambda name: {"imv": "/usr/bin/imv", "xdg-open": "/usr/bin/xdg-open"}.get(name), platform="linux")
         self.assertEqual(tools["open"], "/usr/bin/imv")
         self.assertIsNone(tools["preview"])
         self.assertIn("not installed (chafa)", grimoire.image_status(tools))
@@ -826,6 +826,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual([n for n in names if n.endswith(".tmp")], [])
         self.assertIn("note.md", names)
 
+    @unittest.skipIf(os.name == "nt", "Windows has no permission bits")
     def test_write_keeps_page_mode(self):
         page = self.library / "private.md"
         page.write_text("x\n")
@@ -1105,6 +1106,14 @@ class HardeningTests(unittest.TestCase):
     def test_npm_and_python_versions_match(self):
         package = json.loads((Path(grimoire.__file__).parent / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(package["version"], grimoire.__version__)
+
+    def test_image_opener_per_platform(self):
+        have = {"imv": "/usr/bin/imv", "xdg-open": "/usr/bin/xdg-open", "open": "/usr/bin/open"}
+        only_open = lambda name: have.get(name) if name == "open" else None
+        self.assertEqual(grimoire.image_tools(which=only_open, platform="darwin")["open"], "/usr/bin/open")
+        self.assertIsNone(grimoire.image_tools(which=only_open, platform="linux")["open"])
+        self.assertEqual(grimoire.image_tools(which=have.get, platform="linux")["open"], "/usr/bin/imv")
+        self.assertEqual(grimoire.image_tools(which=lambda _n: None, platform="win32")["open"], grimoire.STARTFILE)
 
     def test_absolute_image_path_is_not_previewed(self):
         with tempfile.TemporaryDirectory() as tmp:

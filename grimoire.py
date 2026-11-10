@@ -15,7 +15,6 @@ The display name is lore. The command and the config keys stay plain.
 from __future__ import annotations
 
 import csv
-import curses
 import hashlib
 import importlib.util
 import json
@@ -28,7 +27,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import termios
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,7 +34,21 @@ from pathlib import Path
 
 __version__ = "0.1.0"
 
-locale.setlocale(locale.LC_ALL, "")
+try:
+    import curses
+except ImportError:  # Windows has no curses in the standard library
+    print("grimoire: this Python has no curses. On Windows run: pip install windows-curses", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    import termios
+except ImportError:  # Windows
+    termios = None
+
+try:
+    locale.setlocale(locale.LC_ALL, "")
+except locale.Error:  # a locale the system does not have
+    pass
 os.environ.setdefault("ESCDELAY", "25")
 
 TEXT_EXT = {
@@ -229,7 +241,7 @@ def atomic_write(path: Path, data: bytes) -> None:
             os.chmod(tmp, 0o666 & ~umask)
         else:
             os.chmod(tmp, old.st_mode & 0o7777)
-            if (old.st_uid, old.st_gid) != (os.getuid(), os.getgid()):
+            if hasattr(os, "getuid") and (old.st_uid, old.st_gid) != (os.getuid(), os.getgid()):
                 try:
                     os.chown(tmp, old.st_uid, old.st_gid)
                 except PermissionError:
@@ -1115,7 +1127,7 @@ def new_child(folder: Path, name: str) -> Path:
 def create_page(folder: Path, raw: str) -> Path:
     path = new_child(folder, clean_name(raw, page=True))
     title = strip_suffix(raw.strip()) or path.stem
-    path.write_text(f"# {title}\n", encoding="utf-8")
+    path.write_text(f"# {title}\n", encoding="utf-8", newline="\n")
     return path
 
 
@@ -1390,17 +1402,24 @@ def image_caption(alt: str, dest: str, *, missing: bool = False) -> str:
     return label + ("  (missing)" if missing else "")
 
 
-def image_tools(which=shutil.which) -> dict[str, str | None]:
-    return {
-        "preview": which("chafa"),
-        "open": which("imv") or which("xdg-open"),
-    }
+STARTFILE = "startfile"  # Windows opens a file with whatever is registered for it
+
+
+def image_tools(which=shutil.which, platform: str | None = None) -> dict[str, str | None]:
+    platform = platform or sys.platform
+    if platform == "win32":
+        opener = STARTFILE
+    elif platform == "darwin":
+        opener = which("imv") or which("open")
+    else:
+        opener = which("imv") or which("xdg-open")
+    return {"preview": which("chafa"), "open": opener}
 
 
 def image_status(tools: dict[str, str | None] | None = None) -> str:
     found = tools or image_tools()
     preview = "chafa" if found["preview"] else "not installed (chafa)"
-    opener = Path(found["open"]).name if found["open"] else "not installed (imv or xdg-open)"
+    opener = Path(found["open"]).name if found["open"] else "not installed (imv, xdg-open, or open)"
     return f"preview  {preview}\nopen     {opener}"
 
 
@@ -1455,6 +1474,9 @@ def open_image(note: Path, raw: str, tools: dict[str, str | None] | None = None,
     opener = found.get("open")
     if not opener:
         return "install imv to view images"
+    if opener == STARTFILE and spawn is None:
+        os.startfile(str(target))
+        return f"opened {target.name}"
     launch = spawn or subprocess.Popen
     launch([opener, str(target)], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return f"opened {target.name}"
@@ -3908,6 +3930,8 @@ def serve_mcp() -> None:
 
 def no_flow_control() -> None:
     """ctrl+s and ctrl+q reach the app instead of pausing and resuming the terminal. endwin puts the shell's setting back."""
+    if termios is None:
+        return
     try:
         fd = sys.stdin.fileno()
         attrs = termios.tcgetattr(fd)
@@ -3950,8 +3974,20 @@ def main(stdscr: curses.window, app: App) -> None:
         return
 
 
+def utf8_pipes() -> None:
+    """Windows pipes default to a legacy code page and CRLF. Pages and the MCP stream are UTF-8 with plain newlines."""
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            if not stream.isatty():
+                stream.reconfigure(encoding="utf-8", newline="\n" if stream is not sys.stdin else None)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def run(argv: list[str] | None = None) -> None:
     args = list(sys.argv[1:] if argv is None else argv)
+    if os.name == "nt" and argv is None:
+        utf8_pipes()
     if args and args[0] in ("help", "--help", "-h"):
         print(USAGE, end="")
         return
@@ -4010,8 +4046,10 @@ def run(argv: list[str] | None = None) -> None:
     if args and args[0] == "setup":
         setup_config(args[1:])
         return
-    previous = signal.getsignal(signal.SIGTSTP)
-    signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+    suspend = getattr(signal, "SIGTSTP", None)  # Windows has no suspend key
+    if suspend is not None:
+        previous = signal.getsignal(suspend)
+        signal.signal(suspend, signal.SIG_IGN)
     try:
         cfg = load_config()
         plugins = load_plugins()
@@ -4024,7 +4062,8 @@ def run(argv: list[str] | None = None) -> None:
             plugins.emit("open", app)
         curses.wrapper(lambda stdscr: main(stdscr, app))
     finally:
-        signal.signal(signal.SIGTSTP, previous)
+        if suspend is not None:
+            signal.signal(suspend, previous)
 
 
 if __name__ == "__main__":
