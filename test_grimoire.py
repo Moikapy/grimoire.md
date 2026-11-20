@@ -565,6 +565,51 @@ class ParseTests(unittest.TestCase):
             self.assertTrue(app.poll_shelf())
             self.assertIn("later.md", [entry.name for entry in app.entries])
 
+    def test_open_page_follows_changes_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "notes.md"
+            page.write_text("# Notes\none\ntwo\nthree\n", encoding="utf-8")
+            app = grimoire.App(root, page)
+            app.open_path(page)
+            app.row, app.col = 2, 2
+            self.assertFalse(app.poll_page())
+            page.write_text("# Notes\none\ntwo changed\nthree\nfour\n", encoding="utf-8")
+            os.utime(page, ns=(1, 1))  # a stamp that cannot match, whatever the clock's grain
+            self.assertTrue(app.poll_page())
+            self.assertEqual(app.lines[2], "two changed")
+            self.assertEqual((app.row, app.col), (2, 2))
+            self.assertEqual(app.message, "reloaded")
+            self.assertFalse(app.poll_page())
+            page.write_text("# Notes\n", encoding="utf-8")
+            os.utime(page, ns=(2, 2))
+            self.assertTrue(app.poll_page())
+            self.assertEqual((app.row, app.col), (0, 2))
+
+    def test_unsaved_edits_survive_a_change_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "notes.md"
+            page.write_text("# Notes\none\n", encoding="utf-8")
+            app = grimoire.App(root, page)
+            app.open_path(page)
+            app.lines[1] = "mine"
+            app.dirty = True
+            page.write_text("# Notes\ntheirs\n", encoding="utf-8")
+            os.utime(page, ns=(1, 1))
+            self.assertTrue(app.poll_page())
+            self.assertEqual(app.lines[1], "mine")
+            self.assertTrue(app.dirty)
+            self.assertIn("changed on disk", app.message)
+            self.assertFalse(app.poll_page())  # one warning for one change
+            self.assertTrue(app.save())
+            self.assertFalse(app.poll_page())  # its own save is not a change
+            self.assertEqual(page.read_text(encoding="utf-8"), "# Notes\nmine\n")
+            page.unlink()
+            self.assertFalse(app.poll_page())
+            app.mode = "list"
+            self.assertFalse(app.poll_page())
+
     def test_shelf_finds_a_file_by_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1390,6 +1435,52 @@ class HardeningTests(unittest.TestCase):
                 for _ in range(10):
                     app.mouse(down)
                 self.assertEqual(app.selected, len(app.listing()) - 1)
+            finally:
+                if old is None:
+                    os.environ.pop("GRIMOIRE_KEYS", None)
+                else:
+                    os.environ["GRIMOIRE_KEYS"] = old
+
+    def test_drag_text_reads_like_a_terminal_selection(self):
+        screen = {
+            0: "  Title                 ",
+            1: "  first line of text    ",
+            2: "                        ",
+            3: "  second line           ",
+            4: "status bar              ",
+        }
+        self.assertEqual(grimoire.drag_text(screen, (1, 8), (1, 11), 24), "line")
+        self.assertEqual(grimoire.drag_text(screen, (1, 11), (1, 8), 24), "line")
+        self.assertEqual(grimoire.drag_text(screen, (1, 8), (3, 7), 24), "line of text\n\nsecond")
+        self.assertEqual(grimoire.drag_text(screen, (0, 0), (3, 23), 24), "Title\nfirst line of text\n\nsecond line")
+        self.assertEqual(grimoire.drag_text(screen, (2, 0), (2, 5), 24), "")
+        self.assertEqual(grimoire.drag_rows((3, 7), (1, 8), 24), [(1, 8, 23), (2, 0, 23), (3, 0, 7)])
+
+    def test_mouse_drag_selects_and_a_click_does_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "note.md"
+            page.write_text("# T\none\ntwo\n", encoding="utf-8")
+            old = os.environ.get("GRIMOIRE_KEYS")
+            os.environ["GRIMOIRE_KEYS"] = str(root / "nokeys.json")
+            try:
+                app = App(root, page, name="x")
+                app.mouse((0, 4, 1, 0, curses.BUTTON1_PRESSED))
+                self.assertTrue(app.dragging)
+                app.mouse((0, 9, 2, 0, curses.REPORT_MOUSE_POSITION))
+                self.assertEqual(app.drag, ((1, 4), (2, 9)))
+                self.assertFalse(app.drag_copy)
+                app.mouse((0, 10, 2, 0, curses.BUTTON1_RELEASED))
+                self.assertEqual(app.drag, ((1, 4), (2, 10)))
+                self.assertTrue(app.drag_copy)
+                self.assertFalse(app.dragging)
+                app.drag_copy = False
+                app.handle(ord("j"))  # any key drops the highlight
+                self.assertIsNone(app.drag)
+                app.mouse((0, 4, 1, 0, curses.BUTTON1_PRESSED))
+                app.mouse((0, 4, 1, 0, curses.BUTTON1_RELEASED))
+                self.assertIsNone(app.drag)
+                self.assertFalse(app.drag_copy)
             finally:
                 if old is None:
                     os.environ.pop("GRIMOIRE_KEYS", None)
