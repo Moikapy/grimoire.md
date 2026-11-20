@@ -565,6 +565,51 @@ class ParseTests(unittest.TestCase):
             self.assertTrue(app.poll_shelf())
             self.assertIn("later.md", [entry.name for entry in app.entries])
 
+    def test_open_page_follows_changes_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "notes.md"
+            page.write_text("# Notes\none\ntwo\nthree\n", encoding="utf-8")
+            app = grimoire.App(root, page)
+            app.open_path(page)
+            app.row, app.col = 2, 2
+            self.assertFalse(app.poll_page())
+            page.write_text("# Notes\none\ntwo changed\nthree\nfour\n", encoding="utf-8")
+            os.utime(page, ns=(1, 1))  # a stamp that cannot match, whatever the clock's grain
+            self.assertTrue(app.poll_page())
+            self.assertEqual(app.lines[2], "two changed")
+            self.assertEqual((app.row, app.col), (2, 2))
+            self.assertEqual(app.message, "reloaded")
+            self.assertFalse(app.poll_page())
+            page.write_text("# Notes\n", encoding="utf-8")
+            os.utime(page, ns=(2, 2))
+            self.assertTrue(app.poll_page())
+            self.assertEqual((app.row, app.col), (0, 2))
+
+    def test_unsaved_edits_survive_a_change_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "notes.md"
+            page.write_text("# Notes\none\n", encoding="utf-8")
+            app = grimoire.App(root, page)
+            app.open_path(page)
+            app.lines[1] = "mine"
+            app.dirty = True
+            page.write_text("# Notes\ntheirs\n", encoding="utf-8")
+            os.utime(page, ns=(1, 1))
+            self.assertTrue(app.poll_page())
+            self.assertEqual(app.lines[1], "mine")
+            self.assertTrue(app.dirty)
+            self.assertIn("changed on disk", app.message)
+            self.assertFalse(app.poll_page())  # one warning for one change
+            self.assertTrue(app.save())
+            self.assertFalse(app.poll_page())  # its own save is not a change
+            self.assertEqual(page.read_text(encoding="utf-8"), "# Notes\nmine\n")
+            page.unlink()
+            self.assertFalse(app.poll_page())
+            app.mode = "list"
+            self.assertFalse(app.poll_page())
+
     def test_shelf_finds_a_file_by_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

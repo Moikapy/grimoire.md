@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 try:
     import curses
@@ -1182,6 +1182,15 @@ def shelf_stamp(path: Path) -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
+def page_stamp(path: Path) -> tuple[int, int] | None:
+    """What a page looked like on disk: enough to tell that something else wrote it."""
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_size)
+
+
 def strip_suffix(text: str, suffixes: tuple[str, ...] = MD_SUFFIXES) -> str:
     lowered = text.lower()
     for suffix in suffixes:
@@ -1915,6 +1924,8 @@ class App:
         self._coalesce: str | None = None
         self.naming = "page"
         self.shelf_stamp: tuple[str, ...] = ()
+        self.page_stamp: tuple[int, int] | None = None  # the open page as last read or saved
+        self.stale_stamp: tuple[int, int] | None = None  # a change on disk already warned about
         self.gdata: dict | None = None
         self.gstate: dict | None = None
         self.gsel = ""
@@ -1973,8 +1984,36 @@ class App:
         self.refresh()
         return True
 
+    def poll_page(self) -> bool:
+        """Show a page that changed on disk while it is open. Unsaved edits are never replaced."""
+        if self.mode != "read" or self.path is None:
+            return False
+        stamp = page_stamp(self.path)
+        if stamp is None or stamp == self.page_stamp:
+            return False
+        if self.dirty:
+            if stamp == self.stale_stamp:
+                return False
+            self.stale_stamp = stamp
+            self.message = f"changed on disk · {self.keys.show('normal', 'reload')} reloads, saving overwrites"
+            return True
+        row, col, inserting = self.row, self.col, self.inserting
+        try:
+            self.open_path(self.path)
+        except OSError:
+            return False  # caught mid-write or just removed: the next tick looks again
+        self.row = min(row, len(self.lines) - 1)
+        self.col = min(col, len(self.lines[self.row]))
+        self.pref_col = self.col
+        self.inserting = inserting
+        self.message = "reloaded"
+        return True
+
     def open_path(self, path: Path) -> None:
+        stamp = page_stamp(path)  # taken before the read, so a write during it is seen on the next poll
         self.lines, self.note = read_lines(path)
+        self.page_stamp = stamp
+        self.stale_stamp = None
         self.sel_from = None
         self.truncated = bool(self.note)
         self.newline, self.final_newline = line_style(path)
@@ -2187,6 +2226,8 @@ class App:
             self.message = f"save failed: {exc}"
             return False
         self.dirty = False
+        self.page_stamp = page_stamp(self.path)
+        self.stale_stamp = None
         self.message = "saved"
         refresh_graph_for(self.path)
         self.backlinks = backlinks_for(self.path)
@@ -3692,12 +3733,15 @@ def bar_spec(app: App) -> tuple[list[str], str, str]:
         label = table.header(app.tcol) if table else "cell"
         return [f"{label}: {app.cell_text}▏", "enter keep", "esc cancel"], "", ""
     if app.inserting:
-        return [
+        parts = [
             "insert",
             key_hint(keys, "insert", "normal", "normal"),
             key_hint(keys, "insert", "save", "save"),
             key_hint(keys, "normal", "help", "keys"),
-        ], keys.show("normal", "help"), right
+        ]
+        if app.stale_stamp is not None:
+            parts.insert(0, "changed on disk")  # stays up while typing: saving would overwrite it
+        return parts, keys.show("normal", "help"), right
     table = app.table() if app.table_view() else None
     if table is not None:
         right = f"row {max(1, app.row)}/{max(0, len(table.rows) - 1)}  col {app.tcol + 1}/{table.columns}"
@@ -4394,7 +4438,7 @@ def main(stdscr: curses.window, app: App) -> None:
             pass
         while True:
             busy = app.mode == "graph" and app.gstate is not None and not app.gstate.get("settled", True)
-            stdscr.timeout(33 if busy else 400 if app.mode == "list" else -1)
+            stdscr.timeout(33 if busy else 400 if app.mode in ("list", "read") else -1)
             if pending:
                 draw(stdscr, app)
                 pending = False
@@ -4404,7 +4448,7 @@ def main(stdscr: curses.window, app: App) -> None:
                     app.step_graph()
                     pending = True
                     continue
-                pending = app.poll_shelf()
+                pending = app.poll_shelf() or app.poll_page()
                 continue
             if not app.handle(key):
                 return

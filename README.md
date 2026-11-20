@@ -42,6 +42,8 @@ grimoire path/to/file.md
 grimoire setup            # shelf path and the name on screen
 ```
 
+An open page follows the file. When something else writes it, an agent or another editor, the page reloads where you are within half a second. Unsaved edits are kept: the status line says the file changed, f5 takes the version on disk, and saving keeps yours.
+
 Keys are `~/.grimoire/keys.json`. `grimoire keys` writes it if it is missing. Action names stay fixed. You change the key list. ctrl+c always quits.
 
 ## Agents
